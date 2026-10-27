@@ -1,0 +1,18 @@
+[package]
+name = "bat84"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Local-first defensive repository inspection CLI"
+license = "MIT"
+
+[[bin]]
+name = "bat84"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
+

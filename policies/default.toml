@@ -1,0 +1,21 @@
+[scan]
+profile = "default"
+network = "deny"
+max_parallel = 4
+timeout_seconds = 300
+max_output_mb = 32
+follow_symlinks = false
+
+[report]
+format = "text"
+include_source_snippets = false
+redact_secrets = true
+
+[remediation]
+mode = "plan-only"
+require_confirmation = true
+
+[tools.semgrep]
+enabled = true
+required = false
+
