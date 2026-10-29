@@ -51,6 +51,13 @@ BAT84_FAIL_ON=high bat84 scan . --format json || echo "policy violation or incom
 
 Patterns are globs (`*` stays within one path segment, `**` crosses directories, `?` matches a single character) and must be quoted. For each finding the first matching path override applies, then the first matching rule override, then `fail_on`, so a location exemption wins over rule tuning; the first definition of a duplicate pattern wins.
 
+`BAT84_FAIL_ON_RULES` and `BAT84_FAIL_ON_PATHS` provide the same overrides from the environment as `pattern=severity` entries separated by `;`. A variable replaces the file's list entirely (an empty value clears it), which suits CI:
+
+```sh
+BAT84_FAIL_ON_RULES='bat84.eval-usage=critical;bat84.hardcoded-password=never' bat84 scan .
+BAT84_FAIL_ON_PATHS='tests/**=never;vendor/**=never' bat84 scan .
+```
+
 `[tools.semgrep] rules` points at a local rules file or directory. When it is unset, `scan` falls back to the bundled `policies/semgrep` directory relative to the working directory, so a scan in this checkout needs no configuration at all; that ruleset covers eval, hardcoded passwords, shell invocation, and unsafe deserialization (pickle, yaml.load, marshal, unserialize). With no rules anywhere (or `enabled = false`), scans report `not_verified`; an explicitly configured path that does not exist exits 2. Setting `required = true` makes a missing Semgrep installation exit 3.
 
 ## Exit codes

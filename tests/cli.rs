@@ -18,6 +18,9 @@ fn bat84(args: &[&str]) -> Command {
     command
         .env_remove("BAT84_REPORT_FORMAT")
         .env_remove("BAT84_NETWORK")
+        .env_remove("BAT84_FAIL_ON")
+        .env_remove("BAT84_FAIL_ON_RULES")
+        .env_remove("BAT84_FAIL_ON_PATHS")
         .args(args);
     command
 }
@@ -417,9 +420,7 @@ fn scan_path_override_applies_to_matching_paths_only() {
     assert!(
         text.contains("\"fail_on_overrides\":{\"rules\":0,\"paths\":1}"),
         "{text}"
-    );
-
-    // A pattern that does not match leaves the global threshold in force.
+    ); // A pattern that does not match leaves the global threshold in force.
     let unmatched = write_config("tests.toml", "tests/**");
     let output = scan(&unmatched);
     assert_eq!(code(&output), 1, "{}", stdout(&output));
@@ -427,6 +428,66 @@ fn scan_path_override_applies_to_matching_paths_only() {
         stdout(&output).contains("\"blocked\":true"),
         "{}",
         stdout(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_env_overrides_replace_the_file_override_lists() {
+    let dir = TempDir::new("fail-on-env-lists");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!(
+            "[scan]\nfail_on = \"high\"\n\n[scan.fail_on_rule]\n\"rules.x\" = \"never\"\n\n[tools.semgrep]\nrules = \"{}\"\n",
+            rules.display()
+        ),
+    );
+    let bin = fake_semgrep(&dir, &high_severity_report(), 0);
+    let scan = |extra: &[(&str, &str)]| -> Output {
+        let mut command = bat84(&[
+            "scan",
+            MANIFEST_DIR,
+            "--config",
+            path_str(&config),
+            "--format",
+            "json",
+        ]);
+        command.env("PATH", path_with(&bin));
+        for (key, value) in extra {
+            command.env(key, value);
+        }
+        command.output().expect("run bat84")
+    };
+
+    // The environment replaces the file's rule list wholesale: the file says
+    // `never`, the variable says `high`, and the high finding blocks again.
+    let replaced = scan(&[("BAT84_FAIL_ON_RULES", "rules.x=high")]);
+    assert_eq!(code(&replaced), 1, "stdout: {}", stdout(&replaced));
+    let text = stdout(&replaced);
+    assert!(
+        text.contains("\"fail_on_overrides\":{\"rules\":1,\"paths\":0}"),
+        "{text}"
+    );
+
+    // Both variables apply together; a matching path still wins over a rule.
+    let both = scan(&[
+        ("BAT84_FAIL_ON_RULES", "rules.x=high"),
+        ("BAT84_FAIL_ON_PATHS", "src/**=never"),
+    ]);
+    assert_eq!(code(&both), 4, "stdout: {}", stdout(&both));
+
+    // An empty value clears the file's list, so the global threshold applies.
+    let cleared = scan(&[("BAT84_FAIL_ON_RULES", "")]);
+    assert_eq!(code(&cleared), 1, "stdout: {}", stdout(&cleared));
+
+    // A malformed list fails loudly before any scan runs.
+    let bad = scan(&[("BAT84_FAIL_ON_RULES", "nonsense")]);
+    assert_eq!(code(&bad), 2);
+    assert!(
+        stderr(&bad).contains("BAT84_FAIL_ON_RULES"),
+        "{}",
+        stderr(&bad)
     );
 }
 

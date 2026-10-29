@@ -849,6 +849,15 @@ fn load_config(args: &[std::ffi::OsString]) -> Result<Config, (u8, String)> {
     if let Ok(value) = env::var("BAT84_FAIL_ON") {
         config.fail_on = value;
     }
+    // The environment replaces the file's override list wholesale, following
+    // the same defaults -> file -> environment -> flags chain as every other
+    // setting; an empty value clears the list.
+    if let Ok(value) = env::var("BAT84_FAIL_ON_RULES") {
+        config.fail_on_rules = parse_override_list("BAT84_FAIL_ON_RULES", &value)?;
+    }
+    if let Ok(value) = env::var("BAT84_FAIL_ON_PATHS") {
+        config.fail_on_paths = parse_override_list("BAT84_FAIL_ON_PATHS", &value)?;
+    }
     validate_config(&config)?;
     Ok(config)
 }
@@ -979,6 +988,49 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Severity values accepted by `fail_on` and its overrides.
+const THRESHOLDS: [&str; 6] = ["critical", "high", "medium", "low", "info", "never"];
+
+/// Parses an override list from an environment variable: `pattern=severity`
+/// entries separated by `;`, with optional whitespace. An empty value yields
+/// an empty list. Errors name the variable so a bad value is easy to trace.
+fn parse_override_list(variable: &str, value: &str) -> Result<Vec<(String, String)>, (u8, String)> {
+    let mut overrides = Vec::new();
+    for entry in value.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // Split at the last `=`: severities never contain one, patterns may.
+        let Some((pattern, severity)) = entry.rsplit_once('=') else {
+            return Err((
+                2,
+                format!("{variable}: entry '{entry}' must have the form pattern=severity"),
+            ));
+        };
+        let (pattern, severity) = (pattern.trim(), severity.trim());
+        if pattern.is_empty() {
+            return Err((
+                2,
+                format!("{variable}: entry '{entry}' has an empty pattern"),
+            ));
+        }
+        if !THRESHOLDS.contains(&severity) {
+            return Err((
+                2,
+                format!(
+                    "{variable}: entry '{entry}' severity must be critical, high, medium, low, info, or never"
+                ),
+            ));
+        }
+        // The first definition of a pattern wins, as in the config file.
+        if !overrides.iter().any(|(existing, _)| *existing == pattern) {
+            overrides.push((pattern.to_string(), severity.to_string()));
+        }
+    }
+    Ok(overrides)
+}
+
 fn validate_config(config: &Config) -> Result<(), (u8, String)> {
     if !["text", "json", "sarif"].contains(&config.report_format.as_str()) {
         return Err((2, "report.format must be text, json, or sarif".into()));
@@ -998,7 +1050,7 @@ fn validate_config(config: &Config) -> Result<(), (u8, String)> {
     if config.semgrep_rules.as_deref() == Some("") {
         return Err((2, "tools.semgrep.rules must not be empty".into()));
     }
-    if !["critical", "high", "medium", "low", "info", "never"].contains(&config.fail_on.as_str()) {
+    if !THRESHOLDS.contains(&config.fail_on.as_str()) {
         return Err((
             2,
             "scan.fail_on must be critical, high, medium, low, info, or never".into(),
@@ -1009,7 +1061,7 @@ fn validate_config(config: &Config) -> Result<(), (u8, String)> {
         .iter()
         .chain(config.fail_on_paths.iter())
     {
-        if !["critical", "high", "medium", "low", "info", "never"].contains(&severity.as_str()) {
+        if !THRESHOLDS.contains(&severity.as_str()) {
             return Err((
                 2,
                 format!(
@@ -1169,6 +1221,48 @@ mod tests {
         let (code, message) = validate_config(&config).unwrap_err();
         assert_eq!(code, 2);
         assert!(message.contains("'x'"), "{message}");
+    }
+
+    #[test]
+    fn parses_override_lists_from_the_environment_syntax() {
+        // Entries are `pattern=severity` separated by `;`, whitespace allowed.
+        let list = parse_override_list(
+            "BAT84_FAIL_ON_RULES",
+            " bat84.eval-usage = never ; bat84.*-password=critical ; ",
+        )
+        .expect("valid list parses");
+        assert_eq!(
+            list,
+            [
+                ("bat84.eval-usage".to_string(), "never".to_string()),
+                ("bat84.*-password".to_string(), "critical".to_string()),
+            ]
+        );
+
+        // An empty value clears the list.
+        assert!(parse_override_list("BAT84_FAIL_ON_PATHS", "")
+            .expect("empty value is valid")
+            .is_empty());
+
+        // The first definition of a pattern wins, as in the config file.
+        let list = parse_override_list("BAT84_FAIL_ON_RULES", "x=never;x=critical")
+            .expect("duplicate parses");
+        assert_eq!(list, [("x".to_string(), "never".to_string())]);
+
+        // Patterns may contain `=`; the split happens at the last one.
+        let list = parse_override_list("BAT84_FAIL_ON_PATHS", "a=b.js=never")
+            .expect("pattern with equals parses");
+        assert_eq!(list, [("a=b.js".to_string(), "never".to_string())]);
+
+        // Malformed entries fail loudly, naming the variable.
+        let (code, message) = parse_override_list("BAT84_FAIL_ON_RULES", "nonsense").unwrap_err();
+        assert_eq!(code, 2);
+        assert!(message.contains("BAT84_FAIL_ON_RULES"), "{message}");
+        assert!(message.contains("pattern=severity"), "{message}");
+        let (_, message) = parse_override_list("BAT84_FAIL_ON_PATHS", "=never").unwrap_err();
+        assert!(message.contains("empty pattern"), "{message}");
+        let (_, message) = parse_override_list("BAT84_FAIL_ON_RULES", "x=sometimes").unwrap_err();
+        assert!(message.contains("severity must be"), "{message}");
     }
 
     #[test]
