@@ -9,6 +9,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod finding;
+mod json;
+mod semgrep;
+mod sha256;
+
+use finding::Finding;
+
 const HELP: &str = "BAT84CODE - local-first defensive repository inspection\n\
 \nUSAGE:\n\
     bat84 <COMMAND> [OPTIONS]\n\
@@ -52,16 +59,14 @@ fn run(args: Vec<std::ffi::OsString>) -> Result<u8, (u8, String)> {
 }
 
 fn doctor(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
-    reject_unknown(
-        args,
-        &["--no-tools", "--format", "--config", "text", "json"],
-    )?;
+    reject_unknown(args, &["--no-tools", "--format", "--config"])?;
     let config = load_config(args)?;
-    let no_tools = args.iter().any(|arg| arg == "--no-tools");
+    let no_tools = option_slice(args).iter().any(|arg| arg == "--no-tools");
     let format = format_arg(args)?.unwrap_or(&config.report_format);
     if format == "sarif" {
         return Err((2, "doctor supports text or json output".into()));
     }
+    reject_positionals(args, "doctor")?;
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
     let tools = ["semgrep", "cargo-audit", "gitleaks", "osv-scanner"];
@@ -124,10 +129,10 @@ fn doctor(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
 }
 
 fn scan(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
-    reject_unknown(args, &["--format", "--config", "text", "json"])?;
+    reject_unknown(args, &["--format", "--config"])?;
     let config = load_config(args)?;
     let format = format_arg(args)?.unwrap_or(&config.report_format);
-    let path = positional(args)
+    let path = single_positional(args, "scan")?
         .map(|value| PathBuf::from(value.as_os_str()))
         .unwrap_or(env::current_dir().map_err(internal)?);
     let canonical = path
@@ -141,18 +146,258 @@ fn scan(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
         return Err((2, "scan path must be a directory".into()));
     }
     let git = canonical.join(".git").exists();
+
+    let (status, findings, semgrep_status, semgrep_version, reason, execution_successful) =
+        match run_semgrep(&config, &canonical)? {
+            SemgrepOutcome::Completed(report) => {
+                let semgrep::Report {
+                    version,
+                    findings,
+                    errors,
+                } = report;
+                let reason = (errors > 0).then(|| {
+                    format!(
+                        "semgrep reported {errors} recoverable error(s); results may be incomplete"
+                    )
+                });
+                (
+                    "partial",
+                    findings,
+                    "completed",
+                    Some(version),
+                    reason,
+                    true,
+                )
+            }
+            SemgrepOutcome::NotRun { reason } => (
+                "not_verified",
+                Vec::new(),
+                "unavailable",
+                None,
+                Some(reason),
+                false,
+            ),
+            SemgrepOutcome::Failed { reason } => (
+                "not_verified",
+                Vec::new(),
+                "failed",
+                None,
+                Some(reason),
+                false,
+            ),
+        };
+
     if format == "sarif" {
-        println!("{{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"version\":\"2.1.0\",\"runs\":[{{\"tool\":{{\"driver\":{{\"name\":\"BAT84CODE\",\"version\":\"0.1.0\",\"rules\":[]}}}},\"invocations\":[{{\"executionSuccessful\":false,\"toolExecutionNotifications\":[{{\"level\":\"warning\",\"message\":{{\"text\":\"Verification incomplete: no analyzer adapter is implemented in this build.\"}}}}]}}],\"results\":[]}}]}}");
+        println!(
+            "{}",
+            scan_sarif(execution_successful, &findings, reason.as_deref())
+        );
     } else if format == "json" {
-        println!("{{\"schema_version\":\"1.0\",\"command\":\"scan\",\"status\":\"not_verified\",\"root\":{},\"repository\":{},\"findings\":[],\"checks\":[{{\"name\":\"analyzers\",\"status\":\"unavailable\",\"reason\":\"no analyzer adapter is implemented in this build\"}}]}}", json_string(&canonical.to_string_lossy()), git);
+        println!(
+            "{}",
+            scan_json(
+                &canonical,
+                git,
+                status,
+                &findings,
+                semgrep_status,
+                semgrep_version.as_deref(),
+                reason.as_deref(),
+            )
+        );
     } else {
-        println!("BAT84CODE scan\nRoot: {}\nRepository: {}\nFindings: 0\nChecks: incomplete (no analyzer adapter is implemented in this build)\nNo files were modified.", canonical.display(), if git { "Git" } else { "directory" });
+        print_scan_text(
+            &canonical,
+            git,
+            status,
+            &findings,
+            semgrep_status,
+            reason.as_deref(),
+        );
     }
+    // Coverage is still incomplete: only the Semgrep adapter exists, and findings
+    // do not yet have a policy-defined blocking threshold.
     Ok(4)
 }
 
+enum SemgrepOutcome {
+    Completed(semgrep::Report),
+    NotRun { reason: String },
+    Failed { reason: String },
+}
+
+fn run_semgrep(config: &Config, root: &std::path::Path) -> Result<SemgrepOutcome, (u8, String)> {
+    if !config.semgrep_enabled {
+        return Ok(SemgrepOutcome::NotRun {
+            reason: "Semgrep is disabled by policy".into(),
+        });
+    }
+    let Some(rules) = config.semgrep_rules.as_deref() else {
+        return Ok(SemgrepOutcome::NotRun {
+            reason: "no Semgrep rules configured ([tools.semgrep] rules)".into(),
+        });
+    };
+    let rules = PathBuf::from(rules);
+    if !rules.exists() {
+        return Err((
+            2,
+            format!("Semgrep rules path does not exist: {}", rules.display()),
+        ));
+    }
+    let Some(executable) = find_executable("semgrep") else {
+        if config.semgrep_required {
+            return Err((3, "required analyzer 'semgrep' is unavailable".into()));
+        }
+        return Ok(SemgrepOutcome::NotRun {
+            reason: "semgrep is not installed".into(),
+        });
+    };
+
+    let arguments = semgrep::arguments(&rules, root);
+    let output_cap = (config.max_output_mb as usize).saturating_mul(1024 * 1024);
+    let result = run_bounded(
+        executable.as_os_str(),
+        &arguments,
+        Duration::from_secs(u64::from(config.timeout_seconds)),
+        output_cap,
+    )
+    .map_err(|error| (6, format!("failed to run semgrep: {error}")))?;
+
+    if result.timed_out {
+        return Ok(SemgrepOutcome::Failed {
+            reason: format!("semgrep exceeded the {} s timeout", config.timeout_seconds),
+        });
+    }
+    match result.status {
+        Some(0) | Some(1) => {}
+        Some(code) => {
+            return Ok(SemgrepOutcome::Failed {
+                reason: format!("semgrep exited with status {code}"),
+            })
+        }
+        None => {
+            return Ok(SemgrepOutcome::Failed {
+                reason: "semgrep terminated without an exit status".into(),
+            })
+        }
+    }
+
+    match semgrep::parse_report(&result.stdout, root) {
+        Ok(report) => Ok(SemgrepOutcome::Completed(report)),
+        Err(error) => Ok(SemgrepOutcome::Failed {
+            reason: format!("semgrep output was rejected: {error}"),
+        }),
+    }
+}
+
+fn display_location(finding: &Finding) -> String {
+    match (finding.line, finding.column) {
+        (Some(line), Some(column)) => format!("{}:{line}:{column}", finding.path),
+        (Some(line), None) => format!("{}:{line}", finding.path),
+        _ => finding.path.clone(),
+    }
+}
+
+fn print_scan_text(
+    root: &std::path::Path,
+    git: bool,
+    status: &str,
+    findings: &[Finding],
+    semgrep_status: &str,
+    reason: Option<&str>,
+) {
+    println!("BAT84CODE scan");
+    println!("Root: {}", root.display());
+    println!("Repository: {}", if git { "Git" } else { "directory" });
+    println!("Status: {status}");
+    println!("Findings: {}", findings.len());
+    for finding in findings {
+        println!(
+            "  {:<8} {}  {}  {}",
+            finding.severity.as_str(),
+            finding.rule_id,
+            display_location(finding),
+            finding.message
+        );
+    }
+    if semgrep_status == "completed" {
+        println!("Checks: partial (semgrep completed; dependency, secret, container, and native checks unavailable)");
+        if let Some(reason) = reason {
+            println!("Note: {reason}");
+        }
+    } else {
+        println!(
+            "Checks: incomplete ({})",
+            reason.unwrap_or("the analyzer did not run")
+        );
+    }
+    println!("No files were modified.");
+}
+
+fn scan_json(
+    root: &std::path::Path,
+    git: bool,
+    status: &str,
+    findings: &[Finding],
+    semgrep_status: &str,
+    semgrep_version: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let entries = findings
+        .iter()
+        .map(Finding::to_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut semgrep_check = format!(
+        "{{\"name\":\"semgrep\",\"status\":{}",
+        json_string(semgrep_status)
+    );
+    if let Some(version) = semgrep_version {
+        semgrep_check.push_str(&format!(",\"version\":{}", json_string(version)));
+    }
+    if let Some(reason) = reason {
+        semgrep_check.push_str(&format!(",\"reason\":{}", json_string(reason)));
+    }
+    semgrep_check.push('}');
+    let mut checks = vec![semgrep_check];
+    for name in ["dependency", "secret", "container", "native"] {
+        checks.push(format!(
+            "{{\"name\":\"{name}\",\"status\":\"unavailable\"}}"
+        ));
+    }
+    format!(
+        "{{\"schema_version\":\"1.0\",\"command\":\"scan\",\"status\":{},\"root\":{},\"repository\":{},\"findings\":[{}],\"checks\":[{}]}}",
+        json_string(status),
+        json_string(&root.to_string_lossy()),
+        git,
+        entries,
+        checks.join(",")
+    )
+}
+
+fn scan_sarif(execution_successful: bool, findings: &[Finding], reason: Option<&str>) -> String {
+    let results = findings
+        .iter()
+        .map(Finding::to_sarif_result)
+        .collect::<Vec<_>>()
+        .join(",");
+    let notification = format!(
+        "{{\"level\":\"warning\",\"message\":{{\"text\":{}}}}}",
+        json_string(&format!(
+            "Verification incomplete: {}",
+            reason.unwrap_or(
+                "semgrep completed but dependency, secret, container, and native checks are unavailable"
+            )
+        ))
+    );
+    format!(
+        "{{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"version\":\"2.1.0\",\"runs\":[{{\"tool\":{{\"driver\":{{\"name\":\"BAT84CODE\",\"version\":\"0.1.0\",\"rules\":[]}}}},\"invocations\":[{{\"executionSuccessful\":{execution_successful},\"toolExecutionNotifications\":[{notification}]}}],\"results\":[{results}]}}]}}"
+    )
+}
+
 fn diff(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
-    let base = positional(args)
+    reject_unknown(args, &[])?;
+    let base = single_positional(args, "diff")?
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "HEAD".into());
     let root = env::current_dir().map_err(internal)?;
@@ -174,33 +419,60 @@ fn diff(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
     Ok(0)
 }
 
+fn os_args(values: &[&str]) -> Vec<std::ffi::OsString> {
+    values.iter().map(std::ffi::OsString::from).collect()
+}
+
 fn self_test(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
-    reject_unknown(args, &["--format", "text", "json"])?;
+    reject_unknown(args, &["--format"])?;
     let format = format_arg(args)?.unwrap_or("text");
     if format == "sarif" {
         return Err((2, "self-test supports text or json output".into()));
     }
-    let checks = ["cli_dispatch", "json_escaping", "exit_codes"];
-    let json_ok = json_string("quote \" slash \\").contains("\\\"");
-    if !json_ok {
-        return Err((6, "built-in JSON escaping check failed".into()));
+    // Each check exercises the behavior it names, using argument lists that fail
+    // before any report is printed.
+    let checks = [
+        (
+            "cli_dispatch",
+            matches!(
+                run(os_args(&["definitely-not-a-command"])),
+                Err((2, message)) if message.contains("unknown command")
+            ),
+        ),
+        (
+            "json_escaping",
+            json_string("quote \" slash \\").contains("\\\""),
+        ),
+        (
+            "exit_codes",
+            matches!(run(os_args(&["scan", "--unknown-option"])), Err((2, _)))
+                && matches!(run(os_args(&["scan", "--config"])), Err((2, _)))
+                && matches!(run(os_args(&["scan", ".", "--format", "xml"])), Err((2, _))),
+        ),
+    ];
+    if let Some((name, _)) = checks.iter().find(|(_, passed)| !*passed) {
+        return Err((6, format!("built-in {name} check failed")));
     }
+    let names = checks.iter().map(|(name, _)| *name).collect::<Vec<_>>();
     if format == "json" {
-        println!("{{\"schema_version\":\"1.0\",\"command\":\"self-test\",\"passed\":true,\"checks\":[\"{}\",\"{}\",\"{}\"]}}", checks[0], checks[1], checks[2]);
+        println!(
+            "{{\"schema_version\":\"1.0\",\"command\":\"self-test\",\"passed\":true,\"checks\":[\"{}\",\"{}\",\"{}\"]}}",
+            names[0], names[1], names[2]
+        );
     } else {
-        println!("Self-test passed: {}", checks.join(", "));
+        println!("Self-test passed: {}", names.join(", "));
     }
     Ok(0)
 }
 
 fn format_arg(args: &[std::ffi::OsString]) -> Result<Option<&str>, (u8, String)> {
-    let mut iter = args.iter();
+    let mut iter = option_slice(args).iter();
     while let Some(arg) = iter.next() {
         if arg == "--format" {
             let value = iter
                 .next()
                 .and_then(|v| v.to_str())
-                .ok_or((2, "--format requires text or json".into()))?;
+                .ok_or((2, "--format requires text, json, or sarif".into()))?;
             if value != "text" && value != "json" && value != "sarif" {
                 return Err((2, "--format must be text, json, or sarif".into()));
             }
@@ -210,26 +482,66 @@ fn format_arg(args: &[std::ffi::OsString]) -> Result<Option<&str>, (u8, String)>
     Ok(None)
 }
 
-fn positional(args: &[std::ffi::OsString]) -> Option<&std::ffi::OsString> {
-    let mut skip_value = false;
-    for arg in args {
-        if skip_value {
-            skip_value = false;
-            continue;
+/// Arguments before a `--` terminator; everything after it is positional data.
+fn option_slice(args: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    &args[..end]
+}
+
+fn positionals(args: &[std::ffi::OsString]) -> Vec<&std::ffi::OsString> {
+    let mut found = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            found.extend(iter.by_ref());
+            break;
         }
         if arg == "--format" || arg == "--config" {
-            skip_value = true;
+            iter.next();
             continue;
         }
         if !arg.to_string_lossy().starts_with('-') {
-            return Some(arg);
+            found.push(arg);
         }
     }
-    None
+    found
+}
+
+fn single_positional<'a>(
+    args: &'a [std::ffi::OsString],
+    command: &str,
+) -> Result<Option<&'a std::ffi::OsString>, (u8, String)> {
+    let values = positionals(args);
+    if let Some(extra) = values.get(1) {
+        return Err((
+            2,
+            format!(
+                "unexpected argument '{}' for {command}",
+                extra.to_string_lossy()
+            ),
+        ));
+    }
+    Ok(values.first().copied())
+}
+
+fn reject_positionals(args: &[std::ffi::OsString], command: &str) -> Result<(), (u8, String)> {
+    if let Some(value) = positionals(args).first() {
+        return Err((
+            2,
+            format!(
+                "{command} does not accept positional arguments (found '{}')",
+                value.to_string_lossy()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn reject_unknown(args: &[std::ffi::OsString], allowed: &[&str]) -> Result<(), (u8, String)> {
-    for arg in args {
+    for arg in option_slice(args) {
         if arg.to_string_lossy().starts_with('-') && !allowed.iter().any(|value| arg == value) {
             return Err((2, format!("unknown option '{}'.", arg.to_string_lossy())));
         }
@@ -304,9 +616,9 @@ fn first_line(output: &str) -> String {
         .collect()
 }
 
-fn run_bounded(
-    program: &std::ffi::OsStr,
-    args: &[&str],
+fn run_bounded<P: AsRef<std::ffi::OsStr>, A: AsRef<std::ffi::OsStr>>(
+    program: P,
+    args: &[A],
     timeout: Duration,
     output_cap: usize,
 ) -> std::io::Result<BoundedResult> {
@@ -379,7 +691,7 @@ fn terminate_process_tree(child: &mut std::process::Child) -> std::io::Result<()
     child.kill()
 }
 
-fn json_string(input: &str) -> String {
+pub(crate) fn json_string(input: &str) -> String {
     let mut out = String::from("\"");
     for ch in input.chars() {
         match ch {
@@ -414,6 +726,7 @@ struct Config {
     require_confirmation: bool,
     semgrep_enabled: bool,
     semgrep_required: bool,
+    semgrep_rules: Option<String>,
 }
 
 impl Default for Config {
@@ -431,19 +744,25 @@ impl Default for Config {
             require_confirmation: true,
             semgrep_enabled: true,
             semgrep_required: false,
+            semgrep_rules: None,
         }
     }
 }
 
 fn load_config(args: &[std::ffi::OsString]) -> Result<Config, (u8, String)> {
-    let config_index = args.iter().position(|arg| arg == "--config");
-    if config_index.is_some_and(|index| args.get(index + 1).is_none()) {
-        return Err((2, "--config requires a path".into()));
-    }
-    let path = config_index
-        .and_then(|index| args.get(index + 1))
-        .map(|value| PathBuf::from(value.as_os_str()))
-        .unwrap_or_else(|| PathBuf::from("bat84.toml"));
+    let options = option_slice(args);
+    let path = match options.iter().position(|arg| arg == "--config") {
+        Some(index) => {
+            let value = options
+                .get(index + 1)
+                .ok_or((2, "--config requires a path".into()))?;
+            if value.to_string_lossy().starts_with('-') {
+                return Err((2, "--config requires a path".into()));
+            }
+            PathBuf::from(value.as_os_str())
+        }
+        None => PathBuf::from("bat84.toml"),
+    };
     let mut config = Config::default();
     if path.exists() {
         let content = std::fs::read_to_string(&path)
@@ -518,6 +837,9 @@ fn parse_config(input: &str, config: &mut Config) -> Result<(), String> {
             ("tools.semgrep", "required") => {
                 config.semgrep_required = parse_bool(value).ok_or_else(fail)?
             }
+            ("tools.semgrep", "rules") => {
+                config.semgrep_rules = Some(parse_string(value).ok_or_else(fail)?)
+            }
             _ => return Err(fail()),
         }
     }
@@ -564,6 +886,9 @@ fn validate_config(config: &Config) -> Result<(), (u8, String)> {
     if config.semgrep_required && !config.semgrep_enabled {
         return Err((2, "required Semgrep cannot be disabled".into()));
     }
+    if config.semgrep_rules.as_deref() == Some("") {
+        return Err((2, "tools.semgrep.rules must not be empty".into()));
+    }
     Ok(())
 }
 
@@ -608,7 +933,27 @@ mod tests {
         assert!(config.require_confirmation);
         assert!(config.semgrep_enabled);
         assert!(!config.semgrep_required);
+        assert_eq!(config.semgrep_rules, None);
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn parses_semgrep_rules_path() {
+        let mut config = Config::default();
+        parse_config(
+            "[tools.semgrep]\nrules = \"policies/semgrep\"\n",
+            &mut config,
+        )
+        .unwrap();
+        assert_eq!(config.semgrep_rules.as_deref(), Some("policies/semgrep"));
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_semgrep_rules_path() {
+        let mut config = Config::default();
+        parse_config("[tools.semgrep]\nrules = \"\"\n", &mut config).unwrap();
+        assert_eq!(validate_config(&config).unwrap_err().0, 2);
     }
 
     #[test]
@@ -692,12 +1037,39 @@ mod tests {
     #[test]
     fn positional_skips_option_values() {
         let values = args(&["--format", "json", "--config", "bat84.toml", "repo"]);
+        let found = positionals(&values);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].to_string_lossy(), "repo");
+        assert!(positionals(&args(&["--format", "json"])).is_empty());
+        assert!(positionals(&args(&["--no-tools"])).is_empty());
+    }
+
+    #[test]
+    fn terminator_allows_dash_prefixed_positionals() {
+        let values = args(&["--format", "json", "--", "-dash-dir"]);
+        let found = positionals(&values);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].to_string_lossy(), "-dash-dir");
+        assert_eq!(format_arg(&values).unwrap(), Some("json"));
+        assert!(reject_unknown(&values, &["--format"]).is_ok());
         assert_eq!(
-            positional(&values).map(|value| value.to_string_lossy().into_owned()),
-            Some("repo".into())
+            single_positional(&values, "scan")
+                .unwrap()
+                .map(|value| value.to_string_lossy().into_owned()),
+            Some("-dash-dir".into())
         );
-        assert!(positional(&args(&["--format", "json"])).is_none());
-        assert!(positional(&args(&["--no-tools"])).is_none());
+    }
+
+    #[test]
+    fn extra_positionals_are_rejected() {
+        assert!(single_positional(&args(&["a", "b"]), "scan").is_err());
+        assert!(single_positional(&args(&["a"]), "scan").unwrap().is_some());
+        assert!(single_positional(&args(&["--format", "json"]), "scan")
+            .unwrap()
+            .is_none());
+        assert!(reject_positionals(&args(&["extra"]), "doctor").is_err());
+        assert!(reject_positionals(&args(&["--no-tools"]), "doctor").is_ok());
+        assert!(reject_positionals(&args(&["--", "extra"]), "doctor").is_err());
     }
 
     #[test]
@@ -706,6 +1078,8 @@ mod tests {
         let (code, message) = reject_unknown(&args(&["--bogus"]), &["--format"]).unwrap_err();
         assert_eq!(code, 2);
         assert!(message.contains("--bogus"), "{message}");
+        // Everything after the terminator is positional data, not an option.
+        assert!(reject_unknown(&args(&["--", "--bogus"]), &[]).is_ok());
     }
 
     #[test]
@@ -715,6 +1089,7 @@ mod tests {
             Some("sarif")
         );
         assert_eq!(format_arg(&args(&[])).unwrap(), None);
+        assert_eq!(format_arg(&args(&["--", "--format", "xml"])).unwrap(), None);
         assert!(format_arg(&args(&["--format"])).is_err());
         assert!(format_arg(&args(&["--format", "xml"])).is_err());
     }

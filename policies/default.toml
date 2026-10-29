@@ -18,4 +18,6 @@ require_confirmation = true
 [tools.semgrep]
 enabled = true
 required = false
+# A local rules file or directory. Semgrep is not run until this is set.
+# rules = "policies/semgrep"
 

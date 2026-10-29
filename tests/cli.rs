@@ -77,6 +77,52 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("test path is valid UTF-8")
 }
 
+/// Installs a fake `semgrep` script that prints `stdout_json` and exits with `exit_code`.
+#[cfg(unix)]
+fn fake_semgrep(dir: &TempDir, stdout_json: &str, exit_code: i32) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("create fake bin directory");
+    let script = bin.join("semgrep");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ncat <<'BAT84_JSON'\n{stdout_json}\nBAT84_JSON\nexit {exit_code}\n"),
+    )
+    .expect("write fake semgrep");
+    let mut permissions = std::fs::metadata(&script)
+        .expect("stat fake semgrep")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).expect("chmod fake semgrep");
+    bin.to_string_lossy().into_owned()
+}
+
+#[cfg(unix)]
+fn path_with(bin: &str) -> String {
+    match std::env::var("PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{bin}:{existing}"),
+        _ => bin.to_owned(),
+    }
+}
+
+#[cfg(unix)]
+fn assert_evidence_digest(text: &str) {
+    let marker = "\"digest\":\"sha256:";
+    let start = text
+        .find(marker)
+        .expect("finding must include an evidence digest")
+        + marker.len();
+    let digest = &text[start..start + 64];
+    assert!(
+        digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()),
+        "digest is not hex: {digest}"
+    );
+    assert_eq!(text.as_bytes()[start + 64], b'"');
+}
+
 #[test]
 fn help_is_available_in_every_documented_form() {
     for args in [&[][..], &["--help"][..], &["-h"][..], &["help"][..]] {
@@ -129,6 +175,226 @@ fn scan_json_and_sarif_are_fail_closed() {
     assert!(text.contains("\"version\":\"2.1.0\""), "{text}");
     assert!(text.contains("\"executionSuccessful\":false"), "{text}");
     assert!(text.contains("\"results\":[]"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_reports_normalized_semgrep_findings() {
+    let dir = TempDir::new("semgrep-findings");
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).expect("create repo dir");
+    std::fs::write(root.join("src/app.js"), "eval(input)").expect("write source file");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!(
+            "[tools.semgrep]\nenabled = true\nrules = \"{}\"\n",
+            rules.display()
+        ),
+    );
+
+    let report = format!(
+        r#"{{"version":"1.95.0","errors":[],"results":[{{"check_id":"rules.no-eval","path":"{}/src/app.js","start":{{"line":1,"col":1}},"end":{{"line":1,"col":7}},"extra":{{"message":"Avoid eval","severity":"ERROR","metadata":{{"confidence":"HIGH"}}}}}}]}}"#,
+        root.display().to_string().replace('\\', "/")
+    );
+    let bin = fake_semgrep(&dir, &report, 0);
+
+    let output = bat84(&[
+        "scan",
+        path_str(&root),
+        "--config",
+        path_str(&config),
+        "--format",
+        "json",
+    ])
+    .env("PATH", path_with(&bin))
+    .output()
+    .expect("run bat84");
+
+    assert_eq!(code(&output), 4);
+    let text = stdout(&output);
+    assert!(text.contains("\"status\":\"partial\""), "{text}");
+    assert!(text.contains("\"rule_id\":\"rules.no-eval\""), "{text}");
+    assert!(text.contains("\"severity\":\"high\""), "{text}");
+    assert!(text.contains("\"confidence\":\"high\""), "{text}");
+    assert!(text.contains("\"path\":\"src/app.js\""), "{text}");
+    assert!(text.contains("\"line\":1"), "{text}");
+    assert!(text.contains("\"column\":1"), "{text}");
+    assert!(text.contains("\"message\":\"Avoid eval\""), "{text}");
+    assert!(
+        text.contains("\"tool\":{\"name\":\"semgrep\",\"version\":\"1.95.0\"}"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"name\":\"semgrep\",\"status\":\"completed\",\"version\":\"1.95.0\""),
+        "{text}"
+    );
+    assert_evidence_digest(&text);
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_sarif_includes_semgrep_results() {
+    let dir = TempDir::new("semgrep-sarif");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!("[tools.semgrep]\nrules = \"{}\"\n", rules.display()),
+    );
+    let report = format!(
+        r#"{{"version":"1.95.0","results":[{{"check_id":"rules.no-eval","path":"{}/src/app.js","start":{{"line":3,"col":2}},"extra":{{"message":"Avoid eval","severity":"ERROR"}}}}]}}"#,
+        MANIFEST_DIR.replace('\\', "/")
+    );
+    let bin = fake_semgrep(&dir, &report, 0);
+
+    let output = bat84(&[
+        "scan",
+        MANIFEST_DIR,
+        "--config",
+        path_str(&config),
+        "--format",
+        "sarif",
+    ])
+    .env("PATH", path_with(&bin))
+    .output()
+    .expect("run bat84");
+
+    assert_eq!(code(&output), 4);
+    let text = stdout(&output);
+    assert!(text.contains("\"executionSuccessful\":true"), "{text}");
+    assert!(text.contains("\"ruleId\":\"rules.no-eval\""), "{text}");
+    assert!(text.contains("\"level\":\"error\""), "{text}");
+    assert!(text.contains("\"uri\":\"src/app.js\""), "{text}");
+    assert!(text.contains("\"startLine\":3"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_treats_malformed_semgrep_output_as_unverified() {
+    let dir = TempDir::new("semgrep-garbage");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!("[tools.semgrep]\nrules = \"{}\"\n", rules.display()),
+    );
+    let bin = fake_semgrep(&dir, "this is not json", 0);
+
+    let output = bat84(&[
+        "scan",
+        MANIFEST_DIR,
+        "--config",
+        path_str(&config),
+        "--format",
+        "json",
+    ])
+    .env("PATH", path_with(&bin))
+    .output()
+    .expect("run bat84");
+
+    assert_eq!(code(&output), 4);
+    let text = stdout(&output);
+    assert!(text.contains("\"status\":\"not_verified\""), "{text}");
+    assert!(text.contains("\"findings\":[]"), "{text}");
+    assert!(text.contains("\"status\":\"failed\""), "{text}");
+    assert!(text.contains("output was rejected"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_rejects_findings_outside_the_scan_root() {
+    let dir = TempDir::new("semgrep-escape");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!("[tools.semgrep]\nrules = \"{}\"\n", rules.display()),
+    );
+    let bin = fake_semgrep(
+        &dir,
+        r#"{"version":"1.95.0","results":[{"check_id":"rules.x","path":"/etc/passwd","start":{"line":1},"extra":{"message":"m"}}]}"#,
+        0,
+    );
+
+    let output = bat84(&[
+        "scan",
+        MANIFEST_DIR,
+        "--config",
+        path_str(&config),
+        "--format",
+        "json",
+    ])
+    .env("PATH", path_with(&bin))
+    .output()
+    .expect("run bat84");
+
+    assert_eq!(code(&output), 4);
+    let text = stdout(&output);
+    assert!(text.contains("\"status\":\"not_verified\""), "{text}");
+    assert!(text.contains("\"findings\":[]"), "{text}");
+    assert!(text.contains("outside the scan root"), "{text}");
+}
+
+#[test]
+fn scan_reports_missing_rules_as_unverified() {
+    let dir = TempDir::new("semgrep-no-rules");
+    let config = dir.write("bat84.toml", "[tools.semgrep]\nenabled = true\n");
+
+    let output = run(&["scan", MANIFEST_DIR, "--config", path_str(&config)]);
+    assert_eq!(code(&output), 4);
+    let text = stdout(&output);
+    assert!(text.contains("Status: not_verified"), "{text}");
+    assert!(text.contains("no Semgrep rules configured"), "{text}");
+}
+
+#[test]
+fn scan_reports_disabled_semgrep_as_unverified() {
+    let dir = TempDir::new("semgrep-disabled");
+    let config = dir.write("bat84.toml", "[tools.semgrep]\nenabled = false\n");
+
+    let output = run(&["scan", MANIFEST_DIR, "--config", path_str(&config)]);
+    assert_eq!(code(&output), 4);
+    assert!(stdout(&output).contains("Semgrep is disabled by policy"));
+}
+
+#[test]
+fn scan_rejects_missing_rules_path() {
+    let dir = TempDir::new("semgrep-bad-rules");
+    let config = dir.write(
+        "bat84.toml",
+        "[tools.semgrep]\nrules = \"definitely/missing/rules.yml\"\n",
+    );
+
+    let output = run(&["scan", MANIFEST_DIR, "--config", path_str(&config)]);
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("Semgrep rules path does not exist"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn scan_fails_when_required_semgrep_is_missing() {
+    let dir = TempDir::new("semgrep-required");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!(
+            "[tools.semgrep]\nenabled = true\nrequired = true\nrules = \"{}\"\n",
+            rules.display()
+        ),
+    );
+
+    let output = bat84(&["scan", MANIFEST_DIR, "--config", path_str(&config)])
+        .env("PATH", "")
+        .output()
+        .expect("run bat84");
+
+    assert_eq!(code(&output), 3);
+    assert!(
+        stderr(&output).contains("required analyzer 'semgrep' is unavailable"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -241,6 +507,69 @@ fn config_flag_requires_a_path() {
     let output = run(&["scan", MANIFEST_DIR, "--config"]);
     assert_eq!(code(&output), 2);
     assert!(stderr(&output).contains("--config requires a path"));
+}
+
+#[test]
+fn config_path_must_not_look_like_an_option() {
+    let output = run(&["scan", MANIFEST_DIR, "--config", "--format"]);
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("--config requires a path"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn doctor_rejects_positional_arguments() {
+    let output = run(&["doctor", "--no-tools", "extra"]);
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("does not accept positional arguments"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
+fn scan_rejects_extra_positional_arguments() {
+    let output = run(&["scan", MANIFEST_DIR, "extra"]);
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("unexpected argument 'extra'"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
+fn diff_rejects_unknown_options() {
+    let output = run(&["diff", "--stat"]);
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("unknown option '--stat'"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn terminator_accepts_dash_prefixed_scan_path() {
+    let dir = TempDir::new("dash-path");
+    std::fs::create_dir(dir.path().join("-dash")).expect("create dash directory");
+
+    let output = bat84(&["scan", "--", "-dash"])
+        .current_dir(dir.path())
+        .output()
+        .expect("run bat84");
+    assert_eq!(code(&output), 4);
+    assert!(
+        stdout(&output).contains("BAT84CODE scan"),
+        "{}",
+        stdout(&output)
+    );
 }
 
 #[test]
