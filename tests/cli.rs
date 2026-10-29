@@ -382,12 +382,11 @@ fn scan_rejects_missing_rules_path() {
 fn scan_fails_when_required_semgrep_is_missing() {
     let dir = TempDir::new("semgrep-required");
     let rules = dir.write("rules.yml", "rules: []\n");
+    // Windows paths contain backslashes, which must be escaped in TOML strings.
+    let rules_toml = rules.display().to_string().replace('\\', "\\\\");
     let config = dir.write(
         "bat84.toml",
-        &format!(
-            "[tools.semgrep]\nenabled = true\nrequired = true\nrules = \"{}\"\n",
-            rules.display()
-        ),
+        &format!("[tools.semgrep]\nenabled = true\nrequired = true\nrules = \"{rules_toml}\"\n"),
     );
 
     let output = bat84(&["scan", MANIFEST_DIR, "--config", path_str(&config)])

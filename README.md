@@ -31,7 +31,7 @@ cargo build --locked --release
 
 The implementation uses only the Rust standard library. `doctor` resolves native executables on `PATH` (`.exe`/`.com` on Windows) and invokes them without a shell. On timeout, Unix platforms terminate the spawned process group; Windows currently terminates only the direct child process. Semgrep is the only analyzer adapter; it is optional and runs only with configured local rules. The CLI does not yet create an isolation sandbox, run build or test commands, or produce remediation. See [docs/limitations.md](docs/limitations.md).
 
-Configuration defaults to `./bat84.toml`; `--config PATH` selects a different file. `BAT84_REPORT_FORMAT` and `BAT84_NETWORK` override file values, and CLI flags override both. The current dependency-free parser accepts the BAT84CODE schema's simple string, boolean, and integer values; unsupported TOML string escapes are rejected.
+Configuration defaults to `./bat84.toml`; `--config PATH` selects a different file. `BAT84_REPORT_FORMAT` and `BAT84_NETWORK` override file values, and CLI flags override both. The current dependency-free parser accepts the BAT84CODE schema's simple string, boolean, and integer values. `\\` and `\"` escapes are supported (needed for Windows paths); other TOML string escapes are rejected.
 
 `[tools.semgrep] rules` must point at a local rules file or directory before Semgrep will run. Without it (or with `enabled = false`), scans report `not_verified`. Setting `required = true` makes a missing Semgrep installation exit 3.
 

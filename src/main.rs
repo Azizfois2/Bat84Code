@@ -847,17 +847,22 @@ fn parse_config(input: &str, config: &mut Config) -> Result<(), String> {
 }
 
 fn parse_string(value: &str) -> Option<String> {
-    if value.len() >= 2
-        && value.starts_with('"')
-        && value.ends_with('"')
-        && !value[1..value.len() - 1]
-            .chars()
-            .any(|ch| ch == '"' || ch == '\\')
-    {
-        Some(value[1..value.len() - 1].to_owned())
-    } else {
-        None
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut output = String::with_capacity(inner.len());
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            // An unescaped quote cannot appear inside a basic string.
+            '"' => return None,
+            '\\' => match characters.next()? {
+                '\\' => output.push('\\'),
+                '"' => output.push('"'),
+                _ => return None,
+            },
+            other => output.push(other),
+        }
     }
+    Some(output)
 }
 fn parse_integer(value: &str) -> Option<u32> {
     value.parse().ok()
@@ -1027,6 +1032,9 @@ mod tests {
         assert_eq!(parse_string("abc"), None);
         assert_eq!(parse_string("\"a\\nb\""), None);
         assert_eq!(parse_string("\""), None);
+        assert_eq!(parse_string(r#""a\\b""#), Some(r"a\b".into()));
+        assert_eq!(parse_string(r#""a\"b""#), Some(r#"a"b"#.into()));
+        assert_eq!(parse_string(r#""a\\""#), Some(r"a\".into()));
         assert_eq!(parse_integer("42"), Some(42));
         assert_eq!(parse_integer("-1"), None);
         assert_eq!(parse_bool("true"), Some(true));
