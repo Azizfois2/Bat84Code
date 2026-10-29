@@ -3,6 +3,10 @@
 # Used automatically when `[tools.semgrep] rules` is unset and this directory
 # is present relative to the working directory, so a scan works with no
 # configuration. Everything is local: no registry or network access.
+#
+# Coverage: command injection, unsafe deserialization, eval, and hardcoded
+# secrets. Patterns favour precision over exhaustiveness: they anchor on APIs
+# that are dangerous by construction rather than on broad syntactic shapes.
 rules:
   - id: bat84.eval-usage
     languages: [javascript, typescript]
@@ -20,3 +24,66 @@ rules:
       confidence: MEDIUM
     pattern: |
       password = "$PASSWORD"
+
+  # --- command injection -------------------------------------------------
+
+  - id: bat84.node-child-process-exec
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Command runs through a shell; prefer execFile or spawn with shell disabled and validate arguments
+    metadata:
+      confidence: MEDIUM
+    pattern-either:
+      - pattern: child_process.exec(...)
+      - pattern: child_process.execSync(...)
+      - pattern: require("child_process").exec(...)
+      - pattern: require("child_process").execSync(...)
+
+  - id: bat84.python-shell-invocation
+    languages: [python]
+    severity: WARNING
+    message: Command runs through a shell; pass an argument list without shell=True, or validate every argument
+    metadata:
+      confidence: MEDIUM
+    pattern-either:
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+      - pattern: subprocess.$F(..., shell=True, ...)
+
+  # --- unsafe deserialization -------------------------------------------
+
+  - id: bat84.python-pickle-deserialization
+    languages: [python]
+    severity: ERROR
+    message: Unpickling can execute arbitrary code; never load data you do not fully control
+    metadata:
+      confidence: HIGH
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+
+  - id: bat84.python-yaml-unsafe-load
+    languages: [python]
+    severity: WARNING
+    message: yaml.load can construct arbitrary objects; use yaml.safe_load instead
+    metadata:
+      confidence: MEDIUM
+    pattern: yaml.load(...)
+
+  - id: bat84.python-marshal-deserialization
+    languages: [python]
+    severity: WARNING
+    message: marshal.loads can execute code while restoring code objects
+    metadata:
+      confidence: MEDIUM
+    pattern: marshal.loads(...)
+
+  - id: bat84.node-unserialize
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Unserializing attacker-controlled data can execute code (for example via node-serialize)
+    metadata:
+      confidence: MEDIUM
+    pattern-either:
+      - pattern: require("node-serialize").unserialize(...)
+      - pattern: $SER.unserialize(...)

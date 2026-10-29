@@ -4,7 +4,7 @@ This repository is the M1 CLI scaffold with an optional Semgrep adapter and a wo
 
 - Full TOML 1.0 parsing (the current dependency-free parser accepts only the simple scalar subset used by `policies/default.toml`) and complete configuration/environment/CLI precedence for every setting.
 - Dependency, secret, container, and native-code checks. Only the optional Semgrep adapter exists, so a scan is at best `partial` and always exits 4.
-- Policy-based blocking. No severity threshold is defined yet, so findings never produce exit code 1.
+- Policy-based blocking uses `[scan] fail_on` (default `high`): findings at or above it return exit 1, otherwise the scan returns 4. Findings with `unknown` severity never block, and there is no per-rule or per-path override yet.
 - Cancellation and per-rule analysis limits. Semgrep receives the configured whole-run timeout and output cap; there is no cancellation or incremental reporting.
 - Platform-specific process cleanup applies to both `doctor` probes and Semgrep runs: Unix children start in a fresh process group that is killed on timeout, while Windows kills only the direct child.
 - Report files. Reports go to stdout only; there is no JSON/SARIF file output, no SARIF rule metadata, and no SARIF fingerprints.
@@ -17,6 +17,7 @@ This repository is the M1 CLI scaffold with an optional Semgrep adapter and a wo
 
 - Semgrep runs only with local rules: an explicit `[tools.semgrep] rules` file or directory, or the bundled `policies/semgrep` directory when that setting is omitted and the directory exists relative to the working directory. There is no registry download and no `--config auto`, so scans stay local-first. The bundled path is resolved from the working directory, not from the binary, so scanning another repository requires setting `rules` explicitly.
 - Invocation is `semgrep scan --json --metrics=off --disable-version-check --no-rewrite-rule-ids --config <rules> <root>`, with argv and no shell. Rule identifiers are not rewritten, so findings and their digests do not depend on the rules file location.
+- The bundled `policies/semgrep` ruleset is a starting point, not a complete rules library: it covers eval, hardcoded passwords, shell invocation (`os.system`, `os.popen`, `subprocess(shell=True)`, `child_process.exec`), and unsafe deserialization (`pickle`, `yaml.load`, `marshal`, `unserialize`). It is deliberately precision-first, so narrower cases such as dynamically imported shell helpers will be missed.
 - `enabled = false`, or no rules anywhere, reports `not_verified`. With `required = true`, a missing Semgrep installation exits 3. An explicitly configured rules path that does not exist exits 2.
 - Analyzer output is untrusted: malformed JSON, missing fields, and paths outside the scan root make the scan `not_verified` with no findings.
 

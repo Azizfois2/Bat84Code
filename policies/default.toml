@@ -5,6 +5,9 @@ max_parallel = 4
 timeout_seconds = 300
 max_output_mb = 32
 follow_symlinks = false
+# Findings at or above this severity make the scan exit 1 (policy blocking).
+# One of: critical, high, medium, low, info, never.
+fail_on = "high"
 
 [report]
 format = "text"

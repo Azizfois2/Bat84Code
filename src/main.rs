@@ -207,37 +207,30 @@ fn scan(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
             ),
         };
 
-    if format == "sarif" {
-        out(format_args!(
-            "{}",
-            scan_sarif(execution_successful, &findings, reason.as_deref())
-        ));
-    } else if format == "json" {
-        out(format_args!(
-            "{}",
-            scan_json(
-                &canonical,
-                git,
-                status,
-                &findings,
-                semgrep_status,
-                semgrep_version.as_deref(),
-                reason.as_deref(),
-            )
-        ));
-    } else {
-        print_scan_text(
-            &canonical,
-            git,
-            status,
-            &findings,
-            semgrep_status,
-            reason.as_deref(),
-        );
+    let blocking = finding::blocking_findings(&findings, &config.fail_on);
+    let summary = ScanSummary {
+        root: &canonical,
+        git,
+        status,
+        findings: &findings,
+        semgrep_status,
+        semgrep_version: semgrep_version.as_deref(),
+        reason: reason.as_deref(),
+        fail_on: &config.fail_on,
+        blocked: !blocking.is_empty(),
+        blocking_count: blocking.len(),
+        execution_successful,
+    };
+
+    match format {
+        "sarif" => out(format_args!("{}", scan_sarif(&summary))),
+        "json" => out(format_args!("{}", scan_json(&summary))),
+        _ => print_scan_text(&summary),
     }
-    // Coverage is still incomplete: only the Semgrep adapter exists, and findings
-    // do not yet have a policy-defined blocking threshold.
-    Ok(4)
+
+    // A policy-blocking finding takes exit code 1. Otherwise coverage is still
+    // incomplete (only the Semgrep adapter exists), so the scan is not verified.
+    Ok(if summary.blocked { 1 } else { 4 })
 }
 
 enum SemgrepOutcome {
@@ -332,23 +325,31 @@ fn display_location(finding: &Finding) -> String {
     }
 }
 
-fn print_scan_text(
-    root: &std::path::Path,
+/// Everything the three scan output formats need to render.
+struct ScanSummary<'a> {
+    root: &'a std::path::Path,
     git: bool,
-    status: &str,
-    findings: &[Finding],
-    semgrep_status: &str,
-    reason: Option<&str>,
-) {
+    status: &'a str,
+    findings: &'a [Finding],
+    semgrep_status: &'a str,
+    semgrep_version: Option<&'a str>,
+    reason: Option<&'a str>,
+    fail_on: &'a str,
+    blocked: bool,
+    blocking_count: usize,
+    execution_successful: bool,
+}
+
+fn print_scan_text(summary: &ScanSummary) {
     out(format_args!("BAT84CODE scan"));
-    out(format_args!("Root: {}", root.display()));
+    out(format_args!("Root: {}", summary.root.display()));
     out(format_args!(
         "Repository: {}",
-        if git { "Git" } else { "directory" }
+        if summary.git { "Git" } else { "directory" }
     ));
-    out(format_args!("Status: {status}"));
-    out(format_args!("Findings: {}", findings.len()));
-    for finding in findings {
+    out(format_args!("Status: {}", summary.status));
+    out(format_args!("Findings: {}", summary.findings.len()));
+    for finding in summary.findings {
         out(format_args!(
             "  {:<8} {}  {}  {}",
             finding.severity.as_str(),
@@ -357,42 +358,41 @@ fn print_scan_text(
             finding.message
         ));
     }
-    if semgrep_status == "completed" {
+    if summary.blocked {
+        out(format_args!(
+            "Blocking: {} finding(s) at or above fail_on = {}",
+            summary.blocking_count, summary.fail_on
+        ));
+    }
+    if summary.semgrep_status == "completed" {
         out(format_args!("Checks: partial (semgrep completed; dependency, secret, container, and native checks unavailable)"));
-        if let Some(reason) = reason {
+        if let Some(reason) = summary.reason {
             out(format_args!("Note: {reason}"));
         }
     } else {
         out(format_args!(
             "Checks: incomplete ({})",
-            reason.unwrap_or("the analyzer did not run")
+            summary.reason.unwrap_or("the analyzer did not run")
         ));
     }
     out(format_args!("No files were modified."));
 }
 
-fn scan_json(
-    root: &std::path::Path,
-    git: bool,
-    status: &str,
-    findings: &[Finding],
-    semgrep_status: &str,
-    semgrep_version: Option<&str>,
-    reason: Option<&str>,
-) -> String {
-    let entries = findings
+fn scan_json(summary: &ScanSummary) -> String {
+    let entries = summary
+        .findings
         .iter()
         .map(Finding::to_json)
         .collect::<Vec<_>>()
         .join(",");
     let mut semgrep_check = format!(
         "{{\"name\":\"semgrep\",\"status\":{}",
-        json_string(semgrep_status)
+        json_string(summary.semgrep_status)
     );
-    if let Some(version) = semgrep_version {
+    if let Some(version) = summary.semgrep_version {
         semgrep_check.push_str(&format!(",\"version\":{}", json_string(version)));
     }
-    if let Some(reason) = reason {
+    if let Some(reason) = summary.reason {
         semgrep_check.push_str(&format!(",\"reason\":{}", json_string(reason)));
     }
     semgrep_check.push('}');
@@ -403,17 +403,20 @@ fn scan_json(
         ));
     }
     format!(
-        "{{\"schema_version\":\"1.0\",\"command\":\"scan\",\"status\":{},\"root\":{},\"repository\":{},\"findings\":[{}],\"checks\":[{}]}}",
-        json_string(status),
-        json_string(&root.to_string_lossy()),
-        git,
+        "{{\"schema_version\":\"1.0\",\"command\":\"scan\",\"status\":{},\"fail_on\":{},\"blocked\":{},\"root\":{},\"repository\":{},\"findings\":[{}],\"checks\":[{}]}}",
+        json_string(summary.status),
+        json_string(summary.fail_on),
+        summary.blocked,
+        json_string(&summary.root.to_string_lossy()),
+        summary.git,
         entries,
         checks.join(",")
     )
 }
 
-fn scan_sarif(execution_successful: bool, findings: &[Finding], reason: Option<&str>) -> String {
-    let results = findings
+fn scan_sarif(summary: &ScanSummary) -> String {
+    let results = summary
+        .findings
         .iter()
         .map(Finding::to_sarif_result)
         .collect::<Vec<_>>()
@@ -422,13 +425,14 @@ fn scan_sarif(execution_successful: bool, findings: &[Finding], reason: Option<&
         "{{\"level\":\"warning\",\"message\":{{\"text\":{}}}}}",
         json_string(&format!(
             "Verification incomplete: {}",
-            reason.unwrap_or(
+            summary.reason.unwrap_or(
                 "semgrep completed but dependency, secret, container, and native checks are unavailable"
             )
         ))
     );
     format!(
-        "{{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"version\":\"2.1.0\",\"runs\":[{{\"tool\":{{\"driver\":{{\"name\":\"BAT84CODE\",\"version\":\"0.1.0\",\"rules\":[]}}}},\"invocations\":[{{\"executionSuccessful\":{execution_successful},\"toolExecutionNotifications\":[{notification}]}}],\"results\":[{results}]}}]}}"
+        "{{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"version\":\"2.1.0\",\"runs\":[{{\"tool\":{{\"driver\":{{\"name\":\"BAT84CODE\",\"version\":\"0.1.0\",\"rules\":[]}}}},\"invocations\":[{{\"executionSuccessful\":{},\"toolExecutionNotifications\":[{notification}]}}],\"results\":[{results}]}}]}}",
+        summary.execution_successful
     )
 }
 
@@ -764,6 +768,7 @@ struct Config {
     semgrep_enabled: bool,
     semgrep_required: bool,
     semgrep_rules: Option<String>,
+    fail_on: String,
 }
 
 impl Default for Config {
@@ -782,6 +787,7 @@ impl Default for Config {
             semgrep_enabled: true,
             semgrep_required: false,
             semgrep_rules: None,
+            fail_on: "high".into(),
         }
     }
 }
@@ -812,6 +818,9 @@ fn load_config(args: &[std::ffi::OsString]) -> Result<Config, (u8, String)> {
     }
     if let Ok(value) = env::var("BAT84_NETWORK") {
         config.network = value;
+    }
+    if let Ok(value) = env::var("BAT84_FAIL_ON") {
+        config.fail_on = value;
     }
     validate_config(&config)?;
     Ok(config)
@@ -855,6 +864,7 @@ fn parse_config(input: &str, config: &mut Config) -> Result<(), String> {
             ("scan", "follow_symlinks") => {
                 config.follow_symlinks = parse_bool(value).ok_or_else(fail)?
             }
+            ("scan", "fail_on") => config.fail_on = parse_string(value).ok_or_else(fail)?,
             ("report", "format") => config.report_format = parse_string(value).ok_or_else(fail)?,
             ("report", "include_source_snippets") => {
                 config.include_source_snippets = parse_bool(value).ok_or_else(fail)?
@@ -931,6 +941,12 @@ fn validate_config(config: &Config) -> Result<(), (u8, String)> {
     if config.semgrep_rules.as_deref() == Some("") {
         return Err((2, "tools.semgrep.rules must not be empty".into()));
     }
+    if !["critical", "high", "medium", "low", "info", "never"].contains(&config.fail_on.as_str()) {
+        return Err((
+            2,
+            "scan.fail_on must be critical, high, medium, low, info, or never".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -976,7 +992,51 @@ mod tests {
         assert!(config.semgrep_enabled);
         assert!(!config.semgrep_required);
         assert_eq!(config.semgrep_rules.as_deref(), Some("policies/semgrep"));
+        assert_eq!(config.fail_on, "high");
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn bundled_ruleset_declares_complete_rules() {
+        let rules = include_str!("../policies/semgrep/default.yml");
+        let blocks: Vec<&str> = rules.split("\n  - id: ").skip(1).collect();
+        assert!(
+            blocks.len() >= 8,
+            "expected the bundled ruleset to ship at least 8 rules, found {}",
+            blocks.len()
+        );
+        for block in blocks {
+            let id = block.lines().next().unwrap_or("").trim();
+            assert!(id.starts_with("bat84."), "unexpected rule id {id}");
+            for key in [
+                "languages:",
+                "severity:",
+                "message:",
+                "pattern",
+                "confidence:",
+            ] {
+                assert!(block.contains(key), "rule {id} is missing {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_fail_on_threshold() {
+        let mut config = Config::default();
+        parse_config("[scan]\nfail_on = \"critical\"\n", &mut config).unwrap();
+        assert_eq!(config.fail_on, "critical");
+        assert!(validate_config(&config).is_ok());
+
+        // Any string parses here; the allowed values are enforced by validation.
+        let mut config = Config::default();
+        parse_config("[scan]\nfail_on = \"yes\"\n", &mut config).unwrap();
+        assert_eq!(config.fail_on, "yes");
+        assert_eq!(validate_config(&config).unwrap_err().0, 2);
+
+        // A non-string value fails to parse, with a line number.
+        let mut config = Config::default();
+        let err = parse_config("[scan]\nfail_on = 3\n", &mut config).unwrap_err();
+        assert!(err.contains("line 2"), "{err}");
     }
 
     #[test]
@@ -1054,12 +1114,15 @@ mod tests {
                 config.semgrep_enabled = false;
                 config.semgrep_required = true;
             }),
+            config_with(|config| config.fail_on = "sometimes".into()),
         ];
         for config in &invalid {
             assert_eq!(validate_config(config).unwrap_err().0, 2);
         }
 
         assert!(validate_config(&config_with(|config| config.network = "allow".into())).is_ok());
+        assert!(validate_config(&config_with(|config| config.fail_on = "never".into())).is_ok());
+        assert!(validate_config(&config_with(|config| config.fail_on = "critical".into())).is_ok());
     }
 
     #[test]

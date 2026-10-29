@@ -164,6 +164,144 @@ fn help_is_available_in_every_documented_form() {
     }
 }
 
+#[cfg(unix)]
+fn manifest_root() -> String {
+    std::path::Path::new(MANIFEST_DIR)
+        .canonicalize()
+        .expect("canonicalize manifest dir")
+        .display()
+        .to_string()
+        .replace('\\', "/")
+}
+
+/// Fake Semgrep report with one high-severity (ERROR) finding.
+#[cfg(unix)]
+fn high_severity_report() -> String {
+    format!(
+        r#"{{"version":"1.95.0","results":[{{"check_id":"rules.x","path":"{}/src/app.js","start":{{"line":1,"col":1}},"extra":{{"message":"Bad thing","severity":"ERROR"}}}}]}}"#,
+        manifest_root()
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_fail_on_never_stays_incomplete() {
+    let dir = TempDir::new("fail-on-never");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!(
+            "[scan]\nfail_on = \"never\"\n\n[tools.semgrep]\nrules = \"{}\"\n",
+            rules.display()
+        ),
+    );
+    let bin = fake_semgrep(&dir, &high_severity_report(), 0);
+
+    let output = bat84(&[
+        "scan",
+        MANIFEST_DIR,
+        "--config",
+        path_str(&config),
+        "--format",
+        "json",
+    ])
+    .env("PATH", path_with(&bin))
+    .output()
+    .expect("run bat84");
+
+    assert_eq!(code(&output), 4);
+    let text = stdout(&output);
+    assert!(text.contains("\"fail_on\":\"never\""), "{text}");
+    assert!(text.contains("\"blocked\":false"), "{text}");
+    assert!(text.contains("\"rule_id\":\"rules.x\""), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_fail_on_threshold_gates_lower_severities() {
+    let dir = TempDir::new("fail-on-critical");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!(
+            "[scan]\nfail_on = \"critical\"\n\n[tools.semgrep]\nrules = \"{}\"\n",
+            rules.display()
+        ),
+    );
+    let bin = fake_semgrep(&dir, &high_severity_report(), 0);
+
+    let output = bat84(&[
+        "scan",
+        MANIFEST_DIR,
+        "--config",
+        path_str(&config),
+        "--format",
+        "json",
+    ])
+    .env("PATH", path_with(&bin))
+    .output()
+    .expect("run bat84");
+
+    // A high finding below the critical threshold does not block.
+    assert_eq!(code(&output), 4);
+    let text = stdout(&output);
+    assert!(text.contains("\"fail_on\":\"critical\""), "{text}");
+    assert!(text.contains("\"blocked\":false"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_fail_on_env_overrides_the_config_file() {
+    let dir = TempDir::new("fail-on-env");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let config = dir.write(
+        "bat84.toml",
+        &format!("[tools.semgrep]\nrules = \"{}\"\n", rules.display()),
+    );
+    let bin = fake_semgrep(&dir, &high_severity_report(), 0);
+    let args = [
+        "scan",
+        MANIFEST_DIR,
+        "--config",
+        path_str(&config),
+        "--format",
+        "json",
+    ];
+
+    let default = bat84(&args)
+        .env("PATH", path_with(&bin))
+        .output()
+        .expect("run bat84");
+    assert_eq!(code(&default), 1, "default fail_on should block");
+
+    let disabled = bat84(&args)
+        .env("PATH", path_with(&bin))
+        .env("BAT84_FAIL_ON", "never")
+        .output()
+        .expect("run bat84");
+    assert_eq!(code(&disabled), 4, "BAT84_FAIL_ON should override");
+    assert!(
+        stdout(&disabled).contains("\"fail_on\":\"never\""),
+        "{}",
+        stdout(&disabled)
+    );
+}
+
+#[test]
+fn scan_rejects_an_invalid_fail_on_threshold() {
+    let dir = TempDir::new("fail-on-invalid");
+    let config = dir.write("bat84.toml", "[scan]\nfail_on = \"sometimes\"\n");
+
+    let output = run(&["scan", MANIFEST_DIR, "--config", path_str(&config)]);
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output)
+            .contains("scan.fail_on must be critical, high, medium, low, info, or never"),
+        "{}",
+        stderr(&output)
+    );
+}
+
 #[test]
 fn reports_survive_a_closed_output_pipe() {
     use std::io::Read;
@@ -280,9 +418,13 @@ fn scan_reports_normalized_semgrep_findings() {
     .output()
     .expect("run bat84");
 
-    assert_eq!(code(&output), 4);
+    // A high-severity finding meets the default fail_on threshold, so the
+    // scan reports exit code 1 (policy blocking) rather than 4.
+    assert_eq!(code(&output), 1);
     let text = stdout(&output);
     assert!(text.contains("\"status\":\"partial\""), "{text}");
+    assert!(text.contains("\"fail_on\":\"high\""), "{text}");
+    assert!(text.contains("\"blocked\":true"), "{text}");
     assert!(text.contains("\"rule_id\":\"rules.no-eval\""), "{text}");
     assert!(text.contains("\"severity\":\"high\""), "{text}");
     assert!(text.contains("\"confidence\":\"high\""), "{text}");
@@ -299,6 +441,25 @@ fn scan_reports_normalized_semgrep_findings() {
         "{text}"
     );
     assert_evidence_digest(&text);
+
+    // The text report must call out the policy decision too.
+    let text_output = bat84(&[
+        "scan",
+        path_str(&root),
+        "--config",
+        path_str(&config),
+        "--format",
+        "text",
+    ])
+    .env("PATH", path_with(&bin))
+    .output()
+    .expect("run bat84");
+    assert_eq!(code(&text_output), 1);
+    assert!(
+        stdout(&text_output).contains("Blocking: 1 finding(s) at or above fail_on = high"),
+        "{}",
+        stdout(&text_output)
+    );
 }
 
 #[cfg(unix)]
@@ -331,7 +492,7 @@ fn scan_sarif_includes_semgrep_results() {
     .output()
     .expect("run bat84");
 
-    assert_eq!(code(&output), 4);
+    assert_eq!(code(&output), 1);
     let text = stdout(&output);
     assert!(text.contains("\"executionSuccessful\":true"), "{text}");
     assert!(text.contains("\"ruleId\":\"rules.no-eval\""), "{text}");

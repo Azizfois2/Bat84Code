@@ -35,6 +35,19 @@ impl Severity {
         }
     }
 
+    /// Ordering used by the blocking threshold. `Unknown` ranks lowest so an
+    /// analyzer that could not classify a result cannot trip CI on its own.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Critical => 5,
+            Self::High => 4,
+            Self::Medium => 3,
+            Self::Low => 2,
+            Self::Info => 1,
+            Self::Unknown => 0,
+        }
+    }
+
     fn sarif_level(self) -> &'static str {
         match self {
             Self::Critical | Self::High => "error",
@@ -212,6 +225,32 @@ pub fn normalize(mut findings: Vec<Finding>) -> Vec<Finding> {
     findings
 }
 
+/// Findings that meet the configured blocking threshold (`fail_on`).
+///
+/// Returns an empty vector for `never` and for unrecognized thresholds; a
+/// `None` threshold means nothing blocks.
+pub fn blocking_findings<'a>(findings: &'a [Finding], fail_on: &str) -> Vec<&'a Finding> {
+    fn threshold(fail_on: &str) -> Option<u8> {
+        match fail_on {
+            "never" => None,
+            "info" => Some(1),
+            "low" => Some(2),
+            "medium" => Some(3),
+            "high" => Some(4),
+            "critical" => Some(5),
+            _ => None,
+        }
+    }
+
+    match threshold(fail_on) {
+        Some(rank) => findings
+            .iter()
+            .filter(|finding| finding.severity.rank() >= rank)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +352,49 @@ mod tests {
         assert_eq!(sorted.len(), 2);
         assert_eq!(sorted[0].path, "a.rs");
         assert_eq!(sorted[1].path, "z.rs");
+    }
+
+    fn with_severity(rule: &str, severity: Severity) -> Finding {
+        Finding::new(
+            rule.into(),
+            severity,
+            Confidence::Unknown,
+            "src/a.rs".into(),
+            Some(1),
+            Some(1),
+            "message".into(),
+            "semgrep".into(),
+            "1.0".into(),
+        )
+    }
+
+    #[test]
+    fn blocking_threshold_gates_findings_by_severity() {
+        let findings = vec![
+            with_severity("c", Severity::Critical),
+            with_severity("h", Severity::High),
+            with_severity("m", Severity::Medium),
+            with_severity("u", Severity::Unknown),
+        ];
+
+        let blocked: Vec<&str> = blocking_findings(&findings, "high")
+            .iter()
+            .map(|finding| finding.rule_id.as_str())
+            .collect();
+        assert_eq!(blocked, ["c", "h"]);
+
+        let blocked: Vec<&str> = blocking_findings(&findings, "medium")
+            .iter()
+            .map(|finding| finding.rule_id.as_str())
+            .collect();
+        assert_eq!(blocked, ["c", "h", "m"]);
+
+        // Unknown severity never blocks, whatever the threshold.
+        assert!(blocking_findings(&findings, "info")
+            .iter()
+            .all(|finding| { finding.severity != Severity::Unknown }));
+        assert!(blocking_findings(&findings, "critical").len() == 1);
+        assert!(blocking_findings(&findings, "never").is_empty());
+        assert!(blocking_findings(&findings, "nonsense").is_empty());
     }
 }
