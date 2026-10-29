@@ -9,6 +9,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Version probes for analyzers such as Semgrep, which is a Python program and
+/// needs several seconds of interpreter startup before it prints anything.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_OUTPUT_CAP: usize = 1024;
+
 mod finding;
 mod json;
 mod semgrep;
@@ -30,6 +35,21 @@ const HELP: &str = "BAT84CODE - local-first defensive repository inspection\n\
     --config PATH           Load configuration (default: ./bat84.toml)\n\
     -h, --help              Show command help\n";
 
+/// Writes a line to stdout and ignores write errors, so a closed downstream
+/// pipe (`bat84 ... | head`) ends quietly instead of panicking mid-run.
+fn out(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{args}");
+}
+
+/// Writes text without a trailing newline; also tolerates a closed pipe.
+fn out_raw(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let _ = write!(stdout, "{args}");
+}
+
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
@@ -42,11 +62,11 @@ fn main() -> ExitCode {
 
 fn run(args: Vec<std::ffi::OsString>) -> Result<u8, (u8, String)> {
     let Some(command) = args.first().and_then(|s| s.to_str()) else {
-        print!("{HELP}");
+        out_raw(format_args!("{HELP}"));
         return Ok(0);
     };
     if command == "-h" || command == "--help" || command == "help" {
-        print!("{HELP}");
+        out_raw(format_args!("{HELP}"));
         return Ok(0);
     }
     match command {
@@ -89,8 +109,8 @@ fn doctor(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
                         .expect("resolved executable")
                         .as_os_str(),
                     &["--version"],
-                    Duration::from_secs(2),
-                    1024,
+                    PROBE_TIMEOUT,
+                    PROBE_OUTPUT_CAP,
                 ) {
                     Ok(result) if result.timed_out => ToolStatus::Timeout,
                     Ok(result) if result.status == Some(0) => {
@@ -117,13 +137,13 @@ fn doctor(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
             })
             .collect::<Vec<_>>()
             .join(",");
-        println!("{{\"schema_version\":\"1.0\",\"command\":\"doctor\",\"platform\":{{\"os\":\"{os}\",\"arch\":\"{arch}\"}},\"tools\":[{entries}]}}");
+        out(format_args!("{{\"schema_version\":\"1.0\",\"command\":\"doctor\",\"platform\":{{\"os\":\"{os}\",\"arch\":\"{arch}\"}},\"tools\":[{entries}]}}"));
     } else {
-        println!("BAT84CODE doctor\nPlatform: {os}/{arch}");
+        out(format_args!("BAT84CODE doctor\nPlatform: {os}/{arch}"));
         for (name, status) in discovered {
-            println!("  {name}: {}", status.display());
+            out(format_args!("  {name}: {}", status.display()));
         }
-        println!("No repository files were modified.");
+        out(format_args!("No repository files were modified."));
     }
     Ok(0)
 }
@@ -188,12 +208,12 @@ fn scan(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
         };
 
     if format == "sarif" {
-        println!(
+        out(format_args!(
             "{}",
             scan_sarif(execution_successful, &findings, reason.as_deref())
-        );
+        ));
     } else if format == "json" {
-        println!(
+        out(format_args!(
             "{}",
             scan_json(
                 &canonical,
@@ -204,7 +224,7 @@ fn scan(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
                 semgrep_version.as_deref(),
                 reason.as_deref(),
             )
-        );
+        ));
     } else {
         print_scan_text(
             &canonical,
@@ -226,24 +246,38 @@ enum SemgrepOutcome {
     Failed { reason: String },
 }
 
+/// Bundled ruleset, resolved relative to the working directory so that a scan
+/// in a checkout of this repository works without any configuration.
+const DEFAULT_RULES_PATH: &str = "policies/semgrep";
+
+/// Returns the rules path to use, or `None` when there are no rules at all.
+/// An explicitly configured path must exist; the bundled fallback is optional.
+fn resolve_rules(config: &Config) -> Result<Option<PathBuf>, (u8, String)> {
+    if let Some(configured) = config.semgrep_rules.as_deref() {
+        let path = PathBuf::from(configured);
+        if !path.exists() {
+            return Err((
+                2,
+                format!("Semgrep rules path does not exist: {}", path.display()),
+            ));
+        }
+        return Ok(Some(path));
+    }
+    let bundled = PathBuf::from(DEFAULT_RULES_PATH);
+    Ok(bundled.is_dir().then_some(bundled))
+}
+
 fn run_semgrep(config: &Config, root: &std::path::Path) -> Result<SemgrepOutcome, (u8, String)> {
     if !config.semgrep_enabled {
         return Ok(SemgrepOutcome::NotRun {
             reason: "Semgrep is disabled by policy".into(),
         });
     }
-    let Some(rules) = config.semgrep_rules.as_deref() else {
+    let Some(rules) = resolve_rules(config)? else {
         return Ok(SemgrepOutcome::NotRun {
-            reason: "no Semgrep rules configured ([tools.semgrep] rules)".into(),
+            reason: "no Semgrep rules configured and no policies/semgrep directory found".into(),
         });
     };
-    let rules = PathBuf::from(rules);
-    if !rules.exists() {
-        return Err((
-            2,
-            format!("Semgrep rules path does not exist: {}", rules.display()),
-        ));
-    }
     let Some(executable) = find_executable("semgrep") else {
         if config.semgrep_required {
             return Err((3, "required analyzer 'semgrep' is unavailable".into()));
@@ -306,32 +340,35 @@ fn print_scan_text(
     semgrep_status: &str,
     reason: Option<&str>,
 ) {
-    println!("BAT84CODE scan");
-    println!("Root: {}", root.display());
-    println!("Repository: {}", if git { "Git" } else { "directory" });
-    println!("Status: {status}");
-    println!("Findings: {}", findings.len());
+    out(format_args!("BAT84CODE scan"));
+    out(format_args!("Root: {}", root.display()));
+    out(format_args!(
+        "Repository: {}",
+        if git { "Git" } else { "directory" }
+    ));
+    out(format_args!("Status: {status}"));
+    out(format_args!("Findings: {}", findings.len()));
     for finding in findings {
-        println!(
+        out(format_args!(
             "  {:<8} {}  {}  {}",
             finding.severity.as_str(),
             finding.rule_id,
             display_location(finding),
             finding.message
-        );
+        ));
     }
     if semgrep_status == "completed" {
-        println!("Checks: partial (semgrep completed; dependency, secret, container, and native checks unavailable)");
+        out(format_args!("Checks: partial (semgrep completed; dependency, secret, container, and native checks unavailable)"));
         if let Some(reason) = reason {
-            println!("Note: {reason}");
+            out(format_args!("Note: {reason}"));
         }
     } else {
-        println!(
+        out(format_args!(
             "Checks: incomplete ({})",
             reason.unwrap_or("the analyzer did not run")
-        );
+        ));
     }
-    println!("No files were modified.");
+    out(format_args!("No files were modified."));
 }
 
 fn scan_json(
@@ -414,7 +451,7 @@ fn diff(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
         return Err((2, "git diff failed; verify the base revision".into()));
     }
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        println!("{line}");
+        out(format_args!("{line}"));
     }
     Ok(0)
 }
@@ -455,12 +492,12 @@ fn self_test(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
     }
     let names = checks.iter().map(|(name, _)| *name).collect::<Vec<_>>();
     if format == "json" {
-        println!(
+        out(format_args!(
             "{{\"schema_version\":\"1.0\",\"command\":\"self-test\",\"passed\":true,\"checks\":[\"{}\",\"{}\",\"{}\"]}}",
             names[0], names[1], names[2]
-        );
+        ));
     } else {
-        println!("Self-test passed: {}", names.join(", "));
+        out(format_args!("Self-test passed: {}", names.join(", ")));
     }
     Ok(0)
 }
@@ -938,7 +975,7 @@ mod tests {
         assert!(config.require_confirmation);
         assert!(config.semgrep_enabled);
         assert!(!config.semgrep_required);
-        assert_eq!(config.semgrep_rules, None);
+        assert_eq!(config.semgrep_rules.as_deref(), Some("policies/semgrep"));
         assert!(validate_config(&config).is_ok());
     }
 

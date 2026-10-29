@@ -15,11 +15,11 @@ The host kernel, analyzers on `PATH`, and the release process are not already co
 ## Initial implementation controls
 
 - `scan` canonicalizes the requested root and writes no repository files.
-- When `[tools.semgrep] rules` points at local rules, `scan` runs Semgrep with argv (no shell), `--metrics=off`, and `--disable-version-check`, bounded by `scan.timeout_seconds` and `scan.max_output_mb`. Unix runs get a separate process group that is killed on timeout; Windows terminates only the direct process.
+- When local rules are configured (explicitly or through the bundled `policies/semgrep` directory), `scan` runs Semgrep with argv (no shell), `--metrics=off`, and `--disable-version-check`, bounded by `scan.timeout_seconds` and `scan.max_output_mb`. Unix runs get a separate process group that is killed on timeout; Windows terminates only the direct process.
 - Analyzer output is untrusted: it is parsed with a depth-limited JSON parser, required fields are validated, and paths outside the scan root or containing traversal are rejected. Any such result makes the scan `not_verified` instead of being reported.
 - `diff` invokes Git with a fixed executable and separate arguments; it does not interpolate through a shell.
 - Analyzer availability is not treated as a successful security check. Only Semgrep can run, so completed scans report `partial` and exit 4; missing required tools exit 3.
-- `doctor` invokes only optional tools' `--version` command with argv (no shell), a 2-second deadline, and a 1 KiB retained-output cap.
+- `doctor` invokes only optional tools' `--version` command with argv (no shell), a 10-second deadline, and a 1 KiB retained-output cap.
 - BAT84CODE makes no network calls, telemetry, model calls, build execution, or remediation. Semgrep is asked not to send metrics or check for updates, but analyzer behavior itself is not sandboxed.
 
 ## Required future controls

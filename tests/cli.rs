@@ -4,7 +4,7 @@
 //! precedence chain (defaults -> config file -> BAT84_* environment -> flags).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -77,6 +77,25 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("test path is valid UTF-8")
 }
 
+/// Runs a scan from an empty temporary directory so neither a `bat84.toml` nor
+/// the bundled `policies/semgrep` fallback can change the outcome.
+fn run_scan(args: &[&str]) -> Output {
+    let dir = TempDir::new("scan-cwd");
+    bat84(args)
+        .current_dir(dir.path())
+        .output()
+        .expect("run bat84")
+}
+
+fn run_scan_with_env(args: &[&str], key: &str, value: &str) -> Output {
+    let dir = TempDir::new("scan-cwd");
+    bat84(args)
+        .current_dir(dir.path())
+        .env(key, value)
+        .output()
+        .expect("run bat84")
+}
+
 /// Installs a fake `semgrep` script that prints `stdout_json` and exits with `exit_code`.
 #[cfg(unix)]
 fn fake_semgrep(dir: &TempDir, stdout_json: &str, exit_code: i32) -> String {
@@ -85,9 +104,13 @@ fn fake_semgrep(dir: &TempDir, stdout_json: &str, exit_code: i32) -> String {
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).expect("create fake bin directory");
     let script = bin.join("semgrep");
+    let argv_log = dir.path().join("semgrep-args.txt");
     std::fs::write(
         &script,
-        format!("#!/bin/sh\ncat <<'BAT84_JSON'\n{stdout_json}\nBAT84_JSON\nexit {exit_code}\n"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat <<'BAT84_JSON'\n{stdout_json}\nBAT84_JSON\nexit {exit_code}\n",
+            argv_log.display()
+        ),
     )
     .expect("write fake semgrep");
     let mut permissions = std::fs::metadata(&script)
@@ -96,6 +119,12 @@ fn fake_semgrep(dir: &TempDir, stdout_json: &str, exit_code: i32) -> String {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).expect("chmod fake semgrep");
     bin.to_string_lossy().into_owned()
+}
+
+#[cfg(unix)]
+fn fake_semgrep_args(dir: &TempDir) -> String {
+    std::fs::read_to_string(dir.path().join("semgrep-args.txt"))
+        .expect("fake semgrep must record its arguments")
 }
 
 #[cfg(unix)]
@@ -136,6 +165,43 @@ fn help_is_available_in_every_documented_form() {
 }
 
 #[test]
+fn reports_survive_a_closed_output_pipe() {
+    use std::io::Read;
+
+    let dir = TempDir::new("closed-pipe");
+    let cases: [(&[&str], i32); 3] = [
+        (&["scan", MANIFEST_DIR, "--format", "json"], 4),
+        (&["--help"], 0),
+        (&["self-test", "--format", "json"], 0),
+    ];
+
+    for (args, expected) in cases {
+        let mut child = bat84(args)
+            .current_dir(dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bat84");
+        // Close the read end before the child writes anything, so every write
+        // fails with a broken pipe.
+        drop(child.stdout.take());
+        let status = child.wait().expect("wait for bat84");
+        let mut stderr_text = String::new();
+        child
+            .stderr
+            .take()
+            .expect("piped stderr")
+            .read_to_string(&mut stderr_text)
+            .expect("read stderr");
+        assert_eq!(status.code(), Some(expected), "args: {args:?}");
+        assert!(
+            !stderr_text.contains("panicked"),
+            "args: {args:?}: {stderr_text}"
+        );
+    }
+}
+
+#[test]
 fn unknown_command_exits_two() {
     let output = run(&["bogus"]);
     assert_eq!(code(&output), 2);
@@ -145,7 +211,7 @@ fn unknown_command_exits_two() {
 
 #[test]
 fn scan_reports_verification_incomplete() {
-    let output = run(&["scan", MANIFEST_DIR]);
+    let output = run_scan(&["scan", MANIFEST_DIR]);
     assert_eq!(
         code(&output),
         4,
@@ -159,7 +225,7 @@ fn scan_reports_verification_incomplete() {
 
 #[test]
 fn scan_json_and_sarif_are_fail_closed() {
-    let json = run(&["scan", MANIFEST_DIR, "--format", "json"]);
+    let json = run_scan(&["scan", MANIFEST_DIR, "--format", "json"]);
     assert_eq!(code(&json), 4);
     let text = stdout(&json);
     assert!(text.contains("\"status\":\"not_verified\""), "{text}");
@@ -169,7 +235,7 @@ fn scan_json_and_sarif_are_fail_closed() {
         "{text}"
     );
 
-    let sarif = run(&["scan", MANIFEST_DIR, "--format", "sarif"]);
+    let sarif = run_scan(&["scan", MANIFEST_DIR, "--format", "sarif"]);
     assert_eq!(code(&sarif), 4);
     let text = stdout(&sarif);
     assert!(text.contains("\"version\":\"2.1.0\""), "{text}");
@@ -344,11 +410,39 @@ fn scan_reports_missing_rules_as_unverified() {
     let dir = TempDir::new("semgrep-no-rules");
     let config = dir.write("bat84.toml", "[tools.semgrep]\nenabled = true\n");
 
-    let output = run(&["scan", MANIFEST_DIR, "--config", path_str(&config)]);
+    // Run outside the checkout so the bundled policies/semgrep fallback is absent.
+    let output = bat84(&["scan", MANIFEST_DIR, "--config", path_str(&config)])
+        .current_dir(dir.path())
+        .output()
+        .expect("run bat84");
     assert_eq!(code(&output), 4);
     let text = stdout(&output);
     assert!(text.contains("Status: not_verified"), "{text}");
     assert!(text.contains("no Semgrep rules configured"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_uses_bundled_rules_out_of_the_box() {
+    let dir = TempDir::new("semgrep-bundled-rules");
+    let bin = fake_semgrep(&dir, r#"{"version":"1.182.1","results":[]}"#, 0);
+
+    // No --config and no bat84.toml: the bundled policies/semgrep directory is used.
+    let output = bat84(&["scan", MANIFEST_DIR, "--format", "json"])
+        .current_dir(std::path::Path::new(MANIFEST_DIR))
+        .env("PATH", path_with(&bin))
+        .output()
+        .expect("run bat84");
+
+    assert_eq!(code(&output), 4);
+    let text = stdout(&output);
+    assert!(text.contains("\"status\":\"partial\""), "{text}");
+    assert!(text.contains("\"status\":\"completed\""), "{text}");
+    let argv = fake_semgrep_args(&dir);
+    assert!(
+        argv.contains("policies/semgrep"),
+        "expected the bundled rules directory, argv was: {argv}"
+    );
 }
 
 #[test]
@@ -422,7 +516,7 @@ fn config_file_selects_the_report_format() {
     let dir = TempDir::new("config-format");
     let config = dir.write("bat84.toml", "[report]\nformat = \"json\"\n");
 
-    let output = run(&["scan", MANIFEST_DIR, "--config", path_str(&config)]);
+    let output = run_scan(&["scan", MANIFEST_DIR, "--config", path_str(&config)]);
     assert_eq!(code(&output), 4);
     let text = stdout(&output);
     assert!(text.contains("\"schema_version\":\"1.0\""), "{text}");
@@ -434,10 +528,11 @@ fn environment_overrides_the_config_file() {
     let dir = TempDir::new("env-overrides-file");
     let config = dir.write("bat84.toml", "[report]\nformat = \"text\"\n");
 
-    let output = bat84(&["scan", MANIFEST_DIR, "--config", path_str(&config)])
-        .env("BAT84_REPORT_FORMAT", "json")
-        .output()
-        .expect("run bat84");
+    let output = run_scan_with_env(
+        &["scan", MANIFEST_DIR, "--config", path_str(&config)],
+        "BAT84_REPORT_FORMAT",
+        "json",
+    );
     assert_eq!(code(&output), 4);
     let text = stdout(&output);
     assert!(text.starts_with('{'), "environment flag should win: {text}");
@@ -446,10 +541,11 @@ fn environment_overrides_the_config_file() {
 
 #[test]
 fn command_line_flag_overrides_the_environment() {
-    let output = bat84(&["scan", MANIFEST_DIR, "--format", "text"])
-        .env("BAT84_REPORT_FORMAT", "sarif")
-        .output()
-        .expect("run bat84");
+    let output = run_scan_with_env(
+        &["scan", MANIFEST_DIR, "--format", "text"],
+        "BAT84_REPORT_FORMAT",
+        "sarif",
+    );
     assert_eq!(code(&output), 4);
     let text = stdout(&output);
     assert!(

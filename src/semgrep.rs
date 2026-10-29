@@ -24,6 +24,9 @@ pub fn arguments(rules: &Path, root: &Path) -> Vec<std::ffi::OsString> {
         // Local-first policy: no metrics upload and no update checks.
         "--metrics=off".into(),
         "--disable-version-check".into(),
+        // Keep rule identifiers stable so findings and their digests do not
+        // depend on where the rules file lives.
+        "--no-rewrite-rule-ids".into(),
         "--config".into(),
     ];
     arguments.push(rules.as_os_str().to_owned());
@@ -197,6 +200,7 @@ mod tests {
                 "--json",
                 "--metrics=off",
                 "--disable-version-check",
+                "--no-rewrite-rule-ids",
                 "--config",
                 "/rules",
                 "/repo"

@@ -1,0 +1,22 @@
+# BAT84CODE bundled ruleset.
+#
+# Used automatically when `[tools.semgrep] rules` is unset and this directory
+# is present relative to the working directory, so a scan works with no
+# configuration. Everything is local: no registry or network access.
+rules:
+  - id: bat84.eval-usage
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Avoid eval(); it executes arbitrary code
+    metadata:
+      confidence: HIGH
+    pattern: eval(...)
+
+  - id: bat84.hardcoded-password
+    languages: [python]
+    severity: WARNING
+    message: Hardcoded password detected
+    metadata:
+      confidence: MEDIUM
+    pattern: |
+      password = "$PASSWORD"

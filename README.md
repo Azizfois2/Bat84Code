@@ -24,8 +24,8 @@ cargo build --locked --release
 
 ## Commands
 
-- `bat84 doctor [--no-tools] [--format text|json]` reports the host platform and probes optional analyzer versions with a 2-second timeout and 1 KiB output cap. `--no-tools` skips subprocess probes.
-- `bat84 scan [PATH] [--format text|json|sarif] [--config PATH]` validates and canonicalizes a directory without writing to it. When `[tools.semgrep] rules` points at local Semgrep rules and Semgrep is installed, it runs Semgrep with metrics and version checks disabled, normalizes findings with SHA-256 evidence digests, and reports `partial`. Dependency, secret, container, and native checks are not implemented, so it still exits 4 and never reports a scan as clean. SARIF output then contains real results and an incomplete-verification notification; unusable analyzer output is reported as `not_verified`.
+- `bat84 doctor [--no-tools] [--format text|json]` reports the host platform and probes optional analyzer versions with a 10-second timeout and 1 KiB output cap. `--no-tools` skips subprocess probes.
+- `bat84 scan [PATH] [--format text|json|sarif] [--config PATH]` validates and canonicalizes a directory without writing to it. Local Semgrep rules are used (the bundled `policies/semgrep` directory by default, or `[tools.semgrep] rules`); when Semgrep is installed it runs with metrics and version checks disabled, normalizes findings with SHA-256 evidence digests, and reports `partial`. Dependency, secret, container, and native checks are not implemented, so it still exits 4 and never reports a scan as clean. SARIF output then contains real results and an incomplete-verification notification; unusable analyzer output is reported as `not_verified`.
 - `bat84 diff [BASE]` lists tracked changed paths against a Git revision, using argv without a shell.
 - `bat84 self-test [--format text|json]` performs built-in integrity checks.
 
@@ -33,7 +33,7 @@ The implementation uses only the Rust standard library. `doctor` resolves native
 
 Configuration defaults to `./bat84.toml`; `--config PATH` selects a different file. `BAT84_REPORT_FORMAT` and `BAT84_NETWORK` override file values, and CLI flags override both. The current dependency-free parser accepts the BAT84CODE schema's simple string, boolean, and integer values. `\\` and `\"` escapes are supported (needed for Windows paths); other TOML string escapes are rejected.
 
-`[tools.semgrep] rules` must point at a local rules file or directory before Semgrep will run. Without it (or with `enabled = false`), scans report `not_verified`. Setting `required = true` makes a missing Semgrep installation exit 3.
+`[tools.semgrep] rules` points at a local rules file or directory. When it is unset, `scan` falls back to the bundled `policies/semgrep` directory relative to the working directory, so a scan in this checkout needs no configuration at all. With no rules anywhere (or `enabled = false`), scans report `not_verified`; an explicitly configured path that does not exist exits 2. Setting `required = true` makes a missing Semgrep installation exit 3.
 
 ## Exit codes
 

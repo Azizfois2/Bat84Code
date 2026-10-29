@@ -18,6 +18,7 @@ require_confirmation = true
 [tools.semgrep]
 enabled = true
 required = false
-# A local rules file or directory. Semgrep is not run until this is set.
-# rules = "policies/semgrep"
+# Local rules file or directory. When omitted, the bundled policies/semgrep
+# directory is used if it is present relative to the working directory.
+rules = "policies/semgrep"
 
