@@ -184,6 +184,9 @@ fn scan_reports_normalized_semgrep_findings() {
     let root = dir.path().join("repo");
     std::fs::create_dir_all(root.join("src")).expect("create repo dir");
     std::fs::write(root.join("src/app.js"), "eval(input)").expect("write source file");
+    // The scan root is canonicalized by the CLI, and macOS temp paths resolve
+    // through the /var symlink, so build the fake report from the real path.
+    let root = root.canonicalize().expect("canonicalize repo dir");
     let rules = dir.write("rules.yml", "rules: []\n");
     let config = dir.write(
         "bat84.toml",
@@ -241,15 +244,18 @@ fn scan_sarif_includes_semgrep_results() {
         "bat84.toml",
         &format!("[tools.semgrep]\nrules = \"{}\"\n", rules.display()),
     );
+    let root = std::path::Path::new(MANIFEST_DIR)
+        .canonicalize()
+        .expect("canonicalize manifest dir");
     let report = format!(
         r#"{{"version":"1.95.0","results":[{{"check_id":"rules.no-eval","path":"{}/src/app.js","start":{{"line":3,"col":2}},"extra":{{"message":"Avoid eval","severity":"ERROR"}}}}]}}"#,
-        MANIFEST_DIR.replace('\\', "/")
+        root.display().to_string().replace('\\', "/")
     );
     let bin = fake_semgrep(&dir, &report, 0);
 
     let output = bat84(&[
         "scan",
-        MANIFEST_DIR,
+        path_str(&root),
         "--config",
         path_str(&config),
         "--format",

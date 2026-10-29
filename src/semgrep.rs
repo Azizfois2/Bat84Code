@@ -161,13 +161,13 @@ mod tests {
         "results": [
             {
                 "check_id": "rules.b-rule",
-                "path": "/repo/z.js",
+                "path": "z.js",
                 "start": {"line": 2, "col": 4},
                 "extra": {"message": "second", "severity": "WARNING"}
             },
             {
                 "check_id": "rules.a-rule",
-                "path": "/repo/src/a.js",
+                "path": "src/a.js",
                 "start": {"line": 9, "col": 1},
                 "extra": {
                     "message": "  first  ",
@@ -177,7 +177,7 @@ mod tests {
             },
             {
                 "check_id": "rules.a-rule",
-                "path": "/repo/src/a.js",
+                "path": "src/a.js",
                 "start": {"line": 9, "col": 1},
                 "extra": {"message": "first", "severity": "ERROR"}
             }
