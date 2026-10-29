@@ -39,6 +39,18 @@ Configuration defaults to `./bat84.toml`; `--config PATH` selects a different fi
 BAT84_FAIL_ON=high bat84 scan . --format json || echo "policy violation or incomplete scan"
 ```
 
+`[scan.fail_on_rule]` and `[scan.fail_on_path]` set thresholds for individual rules or path prefixes, so a noisy rule or a test tree can be exempted or tightened:
+
+```toml
+[scan.fail_on_rule]
+"bat84.hardcoded-password" = "never"
+
+[scan.fail_on_path]
+"tests/**" = "critical"
+```
+
+Patterns are globs (`*` stays within one path segment, `**` crosses directories, `?` matches a single character) and must be quoted. For each finding the first matching path override applies, then the first matching rule override, then `fail_on`, so a location exemption wins over rule tuning; the first definition of a duplicate pattern wins.
+
 `[tools.semgrep] rules` points at a local rules file or directory. When it is unset, `scan` falls back to the bundled `policies/semgrep` directory relative to the working directory, so a scan in this checkout needs no configuration at all; that ruleset covers eval, hardcoded passwords, shell invocation, and unsafe deserialization (pickle, yaml.load, marshal, unserialize). With no rules anywhere (or `enabled = false`), scans report `not_verified`; an explicitly configured path that does not exist exits 2. Setting `required = true` makes a missing Semgrep installation exit 3.
 
 ## Exit codes

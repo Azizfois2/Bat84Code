@@ -8,6 +8,13 @@ follow_symlinks = false
 # Findings at or above this severity make the scan exit 1 (policy blocking).
 # One of: critical, high, medium, low, info, never.
 fail_on = "high"
+# Optional per-rule and per-path thresholds; the first matching entry wins,
+# path before rule, before the fail_on default above. Patterns are globs.
+# [scan.fail_on_rule]
+# "bat84.hardcoded-password" = "never"
+#
+# [scan.fail_on_path]
+# "tests/**" = "never"
 
 [report]
 format = "text"

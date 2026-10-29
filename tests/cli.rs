@@ -302,6 +302,134 @@ fn scan_rejects_an_invalid_fail_on_threshold() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn scan_rule_override_tightens_and_silences_rules() {
+    let dir = TempDir::new("fail-on-rule");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let bin = fake_semgrep(&dir, &high_severity_report(), 0);
+    let write_config = |label: &str, fail_on: &str, overrides: &str| {
+        dir.write(
+            label,
+            &format!(
+                "[scan]\nfail_on = \"{fail_on}\"\n{overrides}[tools.semgrep]\nrules = \"{}\"\n",
+                rules.display()
+            ),
+        )
+    };
+    let scan = |config: &PathBuf, format: &str| -> Output {
+        bat84(&[
+            "scan",
+            MANIFEST_DIR,
+            "--config",
+            path_str(config),
+            "--format",
+            format,
+        ])
+        .env("PATH", path_with(&bin))
+        .output()
+        .expect("run bat84")
+    };
+
+    // A per-rule threshold below the global one tightens the rule: the high
+    // finding blocks even though `fail_on = critical` would not catch it.
+    let tightened = write_config(
+        "tight.toml",
+        "critical",
+        "[scan.fail_on_rule]\n\"rules.x\" = \"high\"\n\n",
+    );
+    let output = scan(&tightened, "json");
+    assert_eq!(
+        code(&output),
+        1,
+        "rule override should block: {}",
+        stdout(&output)
+    );
+    let text = stdout(&output);
+    assert!(text.contains("\"fail_on\":\"critical\""), "{text}");
+    assert!(
+        text.contains("\"fail_on_overrides\":{\"rules\":1,\"paths\":0}"),
+        "{text}"
+    );
+    assert!(text.contains("\"blocked\":true"), "{text}");
+
+    // The same rule silenced explicitly: the finding no longer blocks.
+    let silenced = write_config(
+        "silent.toml",
+        "high",
+        "[scan.fail_on_rule]\n\"rules.x\" = \"never\"\n\n",
+    );
+    let output = scan(&silenced, "json");
+    assert_eq!(code(&output), 4, "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("\"blocked\":false"),
+        "{}",
+        stdout(&output)
+    );
+
+    // Text output reports the configured policy whenever overrides exist.
+    let output = scan(&tightened, "text");
+    assert_eq!(code(&output), 1);
+    let text = stdout(&output);
+    assert!(
+        text.contains(
+            "Blocking: 1 finding(s) (fail_on = critical, 1 rule override(s), 0 path override(s))"
+        ),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_path_override_applies_to_matching_paths_only() {
+    let dir = TempDir::new("fail-on-path");
+    let rules = dir.write("rules.yml", "rules: []\n");
+    let bin = fake_semgrep(&dir, &high_severity_report(), 0);
+    let write_config = |label: &str, pattern: &str| {
+        dir.write(
+            label,
+            &format!(
+                "[scan]\nfail_on = \"high\"\n\n[scan.fail_on_path]\n\"{pattern}\" = \"never\"\n\n[tools.semgrep]\nrules = \"{}\"\n",
+                rules.display()
+            ),
+        )
+    };
+    let scan = |config: &PathBuf| -> Output {
+        bat84(&[
+            "scan",
+            MANIFEST_DIR,
+            "--config",
+            path_str(config),
+            "--format",
+            "json",
+        ])
+        .env("PATH", path_with(&bin))
+        .output()
+        .expect("run bat84")
+    };
+
+    // The finding lives in src/, so the matching exemption suppresses it.
+    let suppressed = write_config("src.toml", "src/**");
+    let output = scan(&suppressed);
+    assert_eq!(code(&output), 4, "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains("\"blocked\":false"), "{text}");
+    assert!(
+        text.contains("\"fail_on_overrides\":{\"rules\":0,\"paths\":1}"),
+        "{text}"
+    );
+
+    // A pattern that does not match leaves the global threshold in force.
+    let unmatched = write_config("tests.toml", "tests/**");
+    let output = scan(&unmatched);
+    assert_eq!(code(&output), 1, "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("\"blocked\":true"),
+        "{}",
+        stdout(&output)
+    );
+}
+
 #[test]
 fn reports_survive_a_closed_output_pipe() {
     use std::io::Read;

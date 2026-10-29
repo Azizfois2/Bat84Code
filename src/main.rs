@@ -207,7 +207,12 @@ fn scan(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
             ),
         };
 
-    let blocking = finding::blocking_findings(&findings, &config.fail_on);
+    let policy = finding::BlockPolicy {
+        fail_on: &config.fail_on,
+        rule_overrides: &config.fail_on_rules,
+        path_overrides: &config.fail_on_paths,
+    };
+    let blocking = finding::blocking_findings(&findings, &policy);
     let summary = ScanSummary {
         root: &canonical,
         git,
@@ -217,6 +222,8 @@ fn scan(args: &[std::ffi::OsString]) -> Result<u8, (u8, String)> {
         semgrep_version: semgrep_version.as_deref(),
         reason: reason.as_deref(),
         fail_on: &config.fail_on,
+        rule_overrides: config.fail_on_rules.len(),
+        path_overrides: config.fail_on_paths.len(),
         blocked: !blocking.is_empty(),
         blocking_count: blocking.len(),
         execution_successful,
@@ -335,6 +342,8 @@ struct ScanSummary<'a> {
     semgrep_version: Option<&'a str>,
     reason: Option<&'a str>,
     fail_on: &'a str,
+    rule_overrides: usize,
+    path_overrides: usize,
     blocked: bool,
     blocking_count: usize,
     execution_successful: bool,
@@ -359,10 +368,22 @@ fn print_scan_text(summary: &ScanSummary) {
         ));
     }
     if summary.blocked {
-        out(format_args!(
-            "Blocking: {} finding(s) at or above fail_on = {}",
-            summary.blocking_count, summary.fail_on
-        ));
+        if summary.rule_overrides == 0 && summary.path_overrides == 0 {
+            out(format_args!(
+                "Blocking: {} finding(s) at or above fail_on = {}",
+                summary.blocking_count, summary.fail_on
+            ));
+        } else {
+            // Overrides change the effective threshold per finding, so report
+            // the configured policy instead of claiming one threshold.
+            out(format_args!(
+                "Blocking: {} finding(s) (fail_on = {}, {} rule override(s), {} path override(s))",
+                summary.blocking_count,
+                summary.fail_on,
+                summary.rule_overrides,
+                summary.path_overrides
+            ));
+        }
     }
     if summary.semgrep_status == "completed" {
         out(format_args!("Checks: partial (semgrep completed; dependency, secret, container, and native checks unavailable)"));
@@ -403,9 +424,11 @@ fn scan_json(summary: &ScanSummary) -> String {
         ));
     }
     format!(
-        "{{\"schema_version\":\"1.0\",\"command\":\"scan\",\"status\":{},\"fail_on\":{},\"blocked\":{},\"root\":{},\"repository\":{},\"findings\":[{}],\"checks\":[{}]}}",
+        "{{\"schema_version\":\"1.0\",\"command\":\"scan\",\"status\":{},\"fail_on\":{},\"fail_on_overrides\":{{\"rules\":{},\"paths\":{}}},\"blocked\":{},\"root\":{},\"repository\":{},\"findings\":[{}],\"checks\":[{}]}}",
         json_string(summary.status),
         json_string(summary.fail_on),
+        summary.rule_overrides,
+        summary.path_overrides,
         summary.blocked,
         json_string(&summary.root.to_string_lossy()),
         summary.git,
@@ -769,6 +792,8 @@ struct Config {
     semgrep_required: bool,
     semgrep_rules: Option<String>,
     fail_on: String,
+    fail_on_rules: Vec<(String, String)>,
+    fail_on_paths: Vec<(String, String)>,
 }
 
 impl Default for Config {
@@ -788,6 +813,8 @@ impl Default for Config {
             semgrep_required: false,
             semgrep_rules: None,
             fail_on: "high".into(),
+            fail_on_rules: Vec::new(),
+            fail_on_paths: Vec::new(),
         }
     }
 }
@@ -836,7 +863,15 @@ fn parse_config(input: &str, config: &mut Config) -> Result<(), String> {
         }
         if line.starts_with('[') && line.ends_with(']') {
             section = line[1..line.len() - 1].trim().to_owned();
-            if !["scan", "report", "remediation", "tools.semgrep"].contains(&section.as_str()) {
+            let known = [
+                "scan",
+                "report",
+                "remediation",
+                "tools.semgrep",
+                "scan.fail_on_rule",
+                "scan.fail_on_path",
+            ];
+            if !known.contains(&section.as_str()) {
                 return Err(format!("line {line_number}: unknown section [{section}]"));
             }
             continue;
@@ -847,6 +882,28 @@ fn parse_config(input: &str, config: &mut Config) -> Result<(), String> {
         let key = key.trim();
         let value = raw_value.trim();
         let fail = || format!("line {line_number}: unknown or invalid key '{key}' in [{section}]");
+        // Override sections map a quoted pattern to a threshold. The first
+        // definition of a pattern wins, matching the first-match-wins rule
+        // used when thresholds are applied to findings.
+        if section == "scan.fail_on_rule" || section == "scan.fail_on_path" {
+            let pattern = parse_string(key)
+                .filter(|pattern| !pattern.is_empty())
+                .ok_or_else(|| {
+                    format!("line {line_number}: expected a quoted pattern key in [{section}]")
+                })?;
+            let severity = parse_string(value).ok_or_else(|| {
+                format!("line {line_number}: expected a quoted severity in [{section}]")
+            })?;
+            let list = if section == "scan.fail_on_rule" {
+                &mut config.fail_on_rules
+            } else {
+                &mut config.fail_on_paths
+            };
+            if !list.iter().any(|(existing, _)| *existing == pattern) {
+                list.push((pattern, severity));
+            }
+            continue;
+        }
         match (section.as_str(), key) {
             ("scan", "profile") => {
                 let _ = parse_string(value).ok_or_else(fail)?;
@@ -947,6 +1004,20 @@ fn validate_config(config: &Config) -> Result<(), (u8, String)> {
             "scan.fail_on must be critical, high, medium, low, info, or never".into(),
         ));
     }
+    for (pattern, severity) in config
+        .fail_on_rules
+        .iter()
+        .chain(config.fail_on_paths.iter())
+    {
+        if !["critical", "high", "medium", "low", "info", "never"].contains(&severity.as_str()) {
+            return Err((
+                2,
+                format!(
+                    "fail_on override for '{pattern}' must be critical, high, medium, low, info, or never"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -993,6 +1064,9 @@ mod tests {
         assert!(!config.semgrep_required);
         assert_eq!(config.semgrep_rules.as_deref(), Some("policies/semgrep"));
         assert_eq!(config.fail_on, "high");
+        // The shipped policy only documents overrides in comments.
+        assert!(config.fail_on_rules.is_empty());
+        assert!(config.fail_on_paths.is_empty());
         assert!(validate_config(&config).is_ok());
     }
 
@@ -1037,6 +1111,64 @@ mod tests {
         let mut config = Config::default();
         let err = parse_config("[scan]\nfail_on = 3\n", &mut config).unwrap_err();
         assert!(err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn parses_fail_on_overrides() {
+        let mut config = Config::default();
+        parse_config(
+            "[scan]\nfail_on = \"high\"\n\n\
+             [scan.fail_on_rule]\n\"bat84.eval-usage\" = \"never\"\n\"bat84.*-password\" = \"critical\"\n\n\
+             [scan.fail_on_path]\n\"tests/**\" = \"never\"\n\"vendor/**\" = \"low\"\n",
+            &mut config,
+        )
+        .expect("override sections parse");
+        assert_eq!(config.fail_on, "high");
+        assert_eq!(
+            config.fail_on_rules,
+            [
+                ("bat84.eval-usage".to_string(), "never".to_string()),
+                ("bat84.*-password".to_string(), "critical".to_string()),
+            ]
+        );
+        assert_eq!(
+            config.fail_on_paths,
+            [
+                ("tests/**".to_string(), "never".to_string()),
+                ("vendor/**".to_string(), "low".to_string()),
+            ]
+        );
+        assert!(validate_config(&config).is_ok());
+
+        // The first definition of a pattern wins.
+        let mut config = Config::default();
+        parse_config(
+            "[scan.fail_on_rule]\n\"x\" = \"never\"\n\"x\" = \"critical\"\n",
+            &mut config,
+        )
+        .expect("duplicate pattern is accepted");
+        assert_eq!(
+            config.fail_on_rules,
+            [("x".to_string(), "never".to_string())]
+        );
+
+        // Keys must be quoted, non-empty patterns.
+        let mut config = Config::default();
+        let err =
+            parse_config("[scan.fail_on_path]\ntests/** = \"never\"\n", &mut config).unwrap_err();
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("quoted pattern key"), "{err}");
+        let mut config = Config::default();
+        let err = parse_config("[scan.fail_on_path]\n\"\" = \"never\"\n", &mut config).unwrap_err();
+        assert!(err.contains("line 2"), "{err}");
+
+        // Severities are enforced by validation, like `fail_on` itself.
+        let mut config = Config::default();
+        parse_config("[scan.fail_on_rule]\n\"x\" = \"sometimes\"\n", &mut config)
+            .expect("any string parses");
+        let (code, message) = validate_config(&config).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(message.contains("'x'"), "{message}");
     }
 
     #[test]
@@ -1115,6 +1247,11 @@ mod tests {
                 config.semgrep_required = true;
             }),
             config_with(|config| config.fail_on = "sometimes".into()),
+            config_with(|config| {
+                config
+                    .fail_on_paths
+                    .push(("tests/**".into(), "sometimes".into()))
+            }),
         ];
         for config in &invalid {
             assert_eq!(validate_config(config).unwrap_err().0, 2);
